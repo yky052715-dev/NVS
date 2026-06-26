@@ -28,10 +28,15 @@ metrics:
   small_defect_area_fraction: 0.01
 
 subspace:
-  nvs_rank: 16
+  nvs_rank: 32
   feature_pca_rank: 16
   max_delta_samples: 100000
   max_feature_samples: 100000
+
+fusion:
+  enabled: true
+  # score = alpha * R0_normalized + (1 - alpha) * R2_normalized
+  alphas: [0.25, 0.50, 0.75]
 
 transforms:
   - {name: brightness, value: -30}

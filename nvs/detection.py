@@ -37,7 +37,22 @@ from nvs.subspace import fit_pca_basis, nvs_residual, pca_feature_residual, samp
 from nvs.transforms import is_spatially_aligned
 
 
-METHODS = ("R0_nn_distance", "R1_feature_pca_residual", "R2_nvs_residual")
+BASE_METHODS = ("R0_nn_distance", "R1_feature_pca_residual", "R2_nvs_residual")
+
+
+def _fusion_method_name(alpha: float) -> str:
+    return f"F_alpha{int(round(float(alpha) * 100)):03d}_r0_r2"
+
+
+def _fusion_alphas(config: dict[str, Any]) -> list[float]:
+    fusion = config.get("fusion", {}) or {}
+    if not bool(fusion.get("enabled", False)):
+        return []
+    return [float(value) for value in fusion.get("alphas", [])]
+
+
+def _all_methods(config: dict[str, Any]) -> list[str]:
+    return list(BASE_METHODS) + [_fusion_method_name(alpha) for alpha in _fusion_alphas(config)]
 
 
 def _loader(records, config: dict[str, Any], include_mask: bool = False) -> DataLoader:
@@ -161,7 +176,7 @@ def _score_batch(features: torch.Tensor, state: dict[str, Any], config: dict[str
 
 @torch.inference_mode()
 def _score_records(records, state: dict[str, Any], config: dict[str, Any], model, device: torch.device, include_mask: bool) -> dict[str, Any]:
-    method_maps: dict[str, list[np.ndarray]] = {method: [] for method in METHODS}
+    method_maps: dict[str, list[np.ndarray]] = {method: [] for method in BASE_METHODS}
     labels: list[int] = []
     masks: list[np.ndarray] = []
     paths: list[str] = []
@@ -198,6 +213,23 @@ def _score_records(records, state: dict[str, Any], config: dict[str, Any], model
     }
 
 
+def _normalize_base_maps(raw_maps_by_method: dict[str, np.ndarray], calibrations: dict[str, dict[str, float]]) -> dict[str, np.ndarray]:
+    normalized: dict[str, np.ndarray] = {}
+    for method in BASE_METHODS:
+        cal = calibrations[method]
+        normalized[method] = np.maximum((raw_maps_by_method[method] - cal["median"]) / cal["mad"], 0.0)
+    return normalized
+
+
+def _add_fusion_maps(maps_by_method: dict[str, np.ndarray], config: dict[str, Any]) -> dict[str, np.ndarray]:
+    output = dict(maps_by_method)
+    r0 = maps_by_method["R0_nn_distance"]
+    r2 = maps_by_method["R2_nvs_residual"]
+    for alpha in _fusion_alphas(config):
+        output[_fusion_method_name(alpha)] = float(alpha) * r0 + (1.0 - float(alpha)) * r2
+    return output
+
+
 def _calibrate_methods(state: dict[str, Any], config: dict[str, Any], model, device: torch.device) -> dict[str, dict[str, float]]:
     calibration = _score_records(
         state["calibration_records"],
@@ -212,7 +244,7 @@ def _calibrate_methods(state: dict[str, Any], config: dict[str, Any], model, dev
     if not fit_indices:
         raise RuntimeError(f"No threshold-fit records found for {state['category']}")
     calibrations: dict[str, dict[str, float]] = {}
-    for method in METHODS:
+    for method in BASE_METHODS:
         raw_maps = calibration["maps"][method]
         flat = raw_maps.reshape(-1)
         median = float(np.median(flat))
@@ -224,8 +256,26 @@ def _calibrate_methods(state: dict[str, Any], config: dict[str, Any], model, dev
             image_quantile=float(config["calibration"]["image_quantile"]),
         )
         calibrations[method] = {
+            "kind": "base",
             "median": median,
             "mad": mad,
+            "pixel_threshold": float(threshold),
+        }
+
+    normalized = _normalize_base_maps(calibration["maps"], calibrations)
+    fused = _add_fusion_maps(normalized, config)
+    for alpha in _fusion_alphas(config):
+        method = _fusion_method_name(alpha)
+        threshold = threshold_image_max(
+            fused[method][np.asarray(fit_indices, dtype=np.int64)],
+            image_quantile=float(config["calibration"]["image_quantile"]),
+        )
+        calibrations[method] = {
+            "kind": "fusion",
+            "alpha_r0": float(alpha),
+            "alpha_r2": float(1.0 - float(alpha)),
+            "median": 0.0,
+            "mad": 1.0,
             "pixel_threshold": float(threshold),
         }
     return calibrations
@@ -235,12 +285,14 @@ def _evaluate_category(category: str, train_records, test_records, config: dict[
     state = _fit_state(category, train_records, config, model, device)
     calibrations = _calibrate_methods(state, config, model, device)
     scored = _score_records(test_records, state, config, model, device, include_mask=True)
+    base_maps = _normalize_base_maps(scored["maps"], calibrations)
+    maps_by_method = _add_fusion_maps(base_maps, config)
     rows: list[dict[str, Any]] = []
     category_dir = output_dir / category
     category_dir.mkdir(parents=True, exist_ok=True)
-    for method in METHODS:
+    for method in _all_methods(config):
         cal = calibrations[method]
-        maps = np.maximum((scored["maps"][method] - cal["median"]) / cal["mad"], 0.0)
+        maps = maps_by_method[method]
         masks = scored["masks"].astype(bool)
         labels = scored["labels"]
         threshold = float(cal["pixel_threshold"])
@@ -257,6 +309,9 @@ def _evaluate_category(category: str, train_records, test_records, config: dict[
         row = {
             "category": category,
             "method": method,
+            "method_kind": str(cal.get("kind", "base")),
+            "alpha_r0": cal.get("alpha_r0"),
+            "alpha_r2": cal.get("alpha_r2"),
             "pixel_AUROC": pixel_auroc,
             "pixel_F1_calibrated": pixel_f1,
             "pixel_F1_oracle": oracle_f1,
@@ -290,15 +345,21 @@ def _evaluate_category(category: str, train_records, test_records, config: dict[
     return rows
 
 
-def _mean_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _mean_rows(rows: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    for method in METHODS:
+    for method in _all_methods(config):
         method_rows = [row for row in rows if row["method"] == method]
         if not method_rows:
             continue
-        summary: dict[str, Any] = {"method": method, "categories": len(method_rows)}
+        summary: dict[str, Any] = {
+            "method": method,
+            "method_kind": method_rows[0].get("method_kind", "base"),
+            "alpha_r0": method_rows[0].get("alpha_r0"),
+            "alpha_r2": method_rows[0].get("alpha_r2"),
+            "categories": len(method_rows),
+        }
         for key in method_rows[0]:
-            if key in {"category", "method"}:
+            if key in {"category", "method", "method_kind", "alpha_r0", "alpha_r2"}:
                 continue
             values = np.asarray([float(row[key]) for row in method_rows], dtype=np.float64)
             summary[key] = float(np.nanmean(values))
@@ -367,7 +428,7 @@ def main() -> None:
         train_records, test_records = build_mvtec_records(args.data_root, category)
         rows.extend(_evaluate_category(category, train_records, test_records, config, model, device, output_dir))
         write_csv(rows, output_dir / "category_metrics.csv")
-        mean_rows = _mean_rows(rows)
+        mean_rows = _mean_rows(rows, config)
         write_csv(mean_rows, output_dir / "method_summary.csv")
         _write_markdown(mean_rows, output_dir / "detection_summary.md")
     save_json(
@@ -375,7 +436,8 @@ def main() -> None:
             "status": "complete",
             "categories": list(config["data"]["categories"]),
             "completed_count": len(config["data"]["categories"]),
-            "methods": list(METHODS),
+            "methods": _all_methods(config),
+            "fusion_alphas": _fusion_alphas(config),
         },
         output_dir / "experiment_complete.json",
     )
