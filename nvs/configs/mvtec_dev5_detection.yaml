@@ -1,5 +1,5 @@
 experiment:
-  output_dir: outputs/nvs/detection_dev5
+  output_dir: outputs/nvs/detection_dev5_locked_rank32
   seed: 42
 
 data:
@@ -34,7 +34,7 @@ subspace:
   max_feature_samples: 100000
 
 fusion:
-  enabled: true
+  enabled: false
   # score = alpha * R0_normalized + (1 - alpha) * R2_normalized
   alphas: [0.25, 0.50, 0.75]
 

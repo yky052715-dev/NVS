@@ -403,6 +403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--categories", nargs="+")
     parser.add_argument("--output-dir")
+    parser.add_argument("--seed", type=int, help="Override experiment.seed from config")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -414,6 +415,8 @@ def main() -> None:
         config["data"]["categories"] = args.categories
     if args.output_dir:
         config["experiment"]["output_dir"] = args.output_dir
+    if args.seed is not None:
+        config["experiment"]["seed"] = int(args.seed)
     seed = int(config["experiment"]["seed"])
     random.seed(seed)
     np.random.seed(seed)
