@@ -28,7 +28,8 @@ from nvs.common import (
 )
 from nvs.metrics import (
     binary_f1,
-    localization_metrics,
+    keep_topk_components,
+    localization_metrics_from_prediction,
     oracle_pixel_f1,
     safe_auroc,
     threshold_image_max,
@@ -44,6 +45,10 @@ def _fusion_method_name(alpha: float) -> str:
     return f"F_alpha{int(round(float(alpha) * 100)):03d}_r0_r2"
 
 
+def _topk_method_name(k: int) -> str:
+    return f"P_topk{int(k)}_r2"
+
+
 def _fusion_alphas(config: dict[str, Any]) -> list[float]:
     fusion = config.get("fusion", {}) or {}
     if not bool(fusion.get("enabled", False)):
@@ -51,8 +56,19 @@ def _fusion_alphas(config: dict[str, Any]) -> list[float]:
     return [float(value) for value in fusion.get("alphas", [])]
 
 
+def _postprocess_topks(config: dict[str, Any]) -> list[int]:
+    postprocess = config.get("postprocess", {}) or {}
+    if not bool(postprocess.get("enabled", False)):
+        return []
+    return [int(value) for value in postprocess.get("topk_components", [])]
+
+
 def _all_methods(config: dict[str, Any]) -> list[str]:
-    return list(BASE_METHODS) + [_fusion_method_name(alpha) for alpha in _fusion_alphas(config)]
+    return (
+        list(BASE_METHODS)
+        + [_fusion_method_name(alpha) for alpha in _fusion_alphas(config)]
+        + [_topk_method_name(k) for k in _postprocess_topks(config)]
+    )
 
 
 def _loader(records, config: dict[str, Any], include_mask: bool = False) -> DataLoader:
@@ -278,6 +294,16 @@ def _calibrate_methods(state: dict[str, Any], config: dict[str, Any], model, dev
             "mad": 1.0,
             "pixel_threshold": float(threshold),
         }
+    for k in _postprocess_topks(config):
+        method = _topk_method_name(k)
+        calibrations[method] = {
+            "kind": "topk_component",
+            "source_method": "R2_nvs_residual",
+            "topk_components": int(k),
+            "median": 0.0,
+            "mad": 1.0,
+            "pixel_threshold": float(calibrations["R2_nvs_residual"]["pixel_threshold"]),
+        }
     return calibrations
 
 
@@ -292,18 +318,23 @@ def _evaluate_category(category: str, train_records, test_records, config: dict[
     category_dir.mkdir(parents=True, exist_ok=True)
     for method in _all_methods(config):
         cal = calibrations[method]
-        maps = maps_by_method[method]
         masks = scored["masks"].astype(bool)
         labels = scored["labels"]
         threshold = float(cal["pixel_threshold"])
+        if cal.get("kind") == "topk_component":
+            source_method = str(cal["source_method"])
+            maps = maps_by_method[source_method]
+            predictions = keep_topk_components(maps >= threshold, k=int(cal["topk_components"]))
+        else:
+            maps = maps_by_method[method]
+            predictions = maps >= threshold
         pixel_auroc = safe_auroc(masks.reshape(-1), maps.reshape(-1))
-        pixel_f1 = binary_f1(masks, maps >= threshold)
+        pixel_f1 = binary_f1(masks, predictions)
         oracle_f1, oracle_threshold = oracle_pixel_f1(masks, maps)
-        loc = localization_metrics(
+        loc = localization_metrics_from_prediction(
             masks,
-            maps,
+            predictions,
             labels,
-            threshold,
             small_defect_area_fraction=float(config["metrics"]["small_defect_area_fraction"]),
         )
         row = {
@@ -312,6 +343,8 @@ def _evaluate_category(category: str, train_records, test_records, config: dict[
             "method_kind": str(cal.get("kind", "base")),
             "alpha_r0": cal.get("alpha_r0"),
             "alpha_r2": cal.get("alpha_r2"),
+            "source_method": cal.get("source_method"),
+            "topk_components": cal.get("topk_components"),
             "pixel_AUROC": pixel_auroc,
             "pixel_F1_calibrated": pixel_f1,
             "pixel_F1_oracle": oracle_f1,
@@ -359,7 +392,7 @@ def _mean_rows(rows: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[
             "categories": len(method_rows),
         }
         for key in method_rows[0]:
-            if key in {"category", "method", "method_kind", "alpha_r0", "alpha_r2"}:
+            if key in {"category", "method", "method_kind", "alpha_r0", "alpha_r2", "source_method", "topk_components"}:
                 continue
             values = np.asarray([float(row[key]) for row in method_rows], dtype=np.float64)
             summary[key] = float(np.nanmean(values))
@@ -441,6 +474,7 @@ def main() -> None:
             "completed_count": len(config["data"]["categories"]),
             "methods": _all_methods(config),
             "fusion_alphas": _fusion_alphas(config),
+            "postprocess_topk_components": _postprocess_topks(config),
         },
         output_dir / "experiment_complete.json",
     )

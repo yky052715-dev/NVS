@@ -85,17 +85,69 @@ def oracle_pixel_f1(masks: np.ndarray, maps: np.ndarray, max_thresholds: int = 5
     return best_f1, best_threshold
 
 
-def localization_metrics(
+def _label_components(binary: np.ndarray) -> tuple[np.ndarray, int]:
+    binary = np.asarray(binary, dtype=bool)
+    try:
+        from scipy import ndimage
+
+        structure = np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+        labels, count = ndimage.label(binary, structure=structure)
+        return labels.astype(np.int32, copy=False), int(count)
+    except Exception:
+        labels = np.zeros(binary.shape, dtype=np.int32)
+        current = 0
+        height, width = binary.shape
+        for y in range(height):
+            for x in range(width):
+                if not binary[y, x] or labels[y, x] != 0:
+                    continue
+                current += 1
+                stack = [(y, x)]
+                labels[y, x] = current
+                while stack:
+                    cy, cx = stack.pop()
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < height and 0 <= nx < width and binary[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = current
+                            stack.append((ny, nx))
+        return labels, current
+
+
+def keep_topk_components(predictions: np.ndarray, k: int) -> np.ndarray:
+    predictions = np.asarray(predictions, dtype=bool)
+    if int(k) <= 0:
+        raise ValueError("k must be positive")
+    if predictions.ndim == 2:
+        predictions = predictions[None]
+        squeeze = True
+    elif predictions.ndim == 3:
+        squeeze = False
+    else:
+        raise ValueError("predictions must have shape [H, W] or [N, H, W]")
+
+    output = np.zeros_like(predictions, dtype=bool)
+    for index, binary in enumerate(predictions):
+        labels, count = _label_components(binary)
+        if count == 0:
+            continue
+        sizes = np.bincount(labels.reshape(-1), minlength=count + 1)
+        sizes[0] = 0
+        keep = np.argsort(sizes)[-int(k) :]
+        keep = keep[sizes[keep] > 0]
+        if keep.size > 0:
+            output[index] = np.isin(labels, keep)
+    return output[0] if squeeze else output
+
+
+def localization_metrics_from_prediction(
     masks: np.ndarray,
-    maps: np.ndarray,
+    predictions: np.ndarray,
     labels: np.ndarray,
-    threshold: float,
     small_defect_area_fraction: float = 0.01,
 ) -> dict[str, float]:
     masks = np.asarray(masks, dtype=bool)
-    maps = np.asarray(maps, dtype=np.float64)
+    predictions = np.asarray(predictions, dtype=bool)
     labels = np.asarray(labels, dtype=np.int64)
-    predictions = maps >= float(threshold)
     flat_masks = masks.reshape(masks.shape[0], -1)
     flat_predictions = predictions.reshape(predictions.shape[0], -1)
     anomaly_indices = np.flatnonzero(labels == 1)
@@ -134,3 +186,19 @@ def localization_metrics(
         "localization_small_defect_recall_macro": float(np.nanmean(small_recall)) if small_recall else float("nan"),
         "localization_test_normal_image_positive_rate": normal_positive_rate,
     }
+
+
+def localization_metrics(
+    masks: np.ndarray,
+    maps: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+    small_defect_area_fraction: float = 0.01,
+) -> dict[str, float]:
+    maps = np.asarray(maps, dtype=np.float64)
+    return localization_metrics_from_prediction(
+        masks,
+        maps >= float(threshold),
+        labels,
+        small_defect_area_fraction=small_defect_area_fraction,
+    )

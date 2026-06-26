@@ -38,6 +38,10 @@ fusion:
   # score = alpha * R0_normalized + (1 - alpha) * R2_normalized
   alphas: [0.25, 0.50, 0.75]
 
+postprocess:
+  enabled: true
+  topk_components: [1, 2, 3]
+
 transforms:
   - {name: brightness, value: -30}
   - {name: brightness, value: -15}

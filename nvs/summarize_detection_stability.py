@@ -204,6 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", nargs="+", type=int, required=True)
     parser.add_argument("--baseline", default="R0_nn_distance")
     parser.add_argument("--candidate", default="R2_nvs_residual")
+    parser.add_argument("--output-prefix", default="detection_stability")
     return parser.parse_args()
 
 
@@ -211,9 +212,9 @@ def main() -> None:
     args = parse_args()
     root = Path(args.root)
     seed_rows, category_rows, markdown = summarize(root, args.seeds, args.baseline, args.candidate)
-    write_csv(seed_rows, root / "seed_summary.csv")
-    write_csv(category_rows, root / "category_delta_summary.csv")
-    (root / "detection_stability_summary.md").write_text(markdown, encoding="utf-8")
+    write_csv(seed_rows, root / f"{args.output_prefix}_seed_summary.csv")
+    write_csv(category_rows, root / f"{args.output_prefix}_category_delta_summary.csv")
+    (root / f"{args.output_prefix}_summary.md").write_text(markdown, encoding="utf-8")
     print(markdown)
 
 
