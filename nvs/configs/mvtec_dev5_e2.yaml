@@ -1,0 +1,45 @@
+experiment:
+  output_dir: outputs/nvs/e2_subspace_residual_dev5
+  seed: 42
+
+data:
+  categories: [bottle, metal_nut, grid, leather, screw]
+  input_size: 518
+  calibration_fraction: 0.20
+  num_workers: 4
+
+model:
+  name: dinov2_vits14
+  hub_dir: null
+  batch_size: 4
+
+memory:
+  max_bank_size: 30000
+  query_chunk_size: 4096
+  bank_chunk_size: 8192
+
+subspace:
+  nvs_rank: 16
+  feature_pca_rank: 16
+  max_delta_samples: 100000
+  max_feature_samples: 100000
+  max_normal_samples: 50000
+  max_defect_samples: 50000
+  defect_mask_threshold: 0.25
+
+transforms:
+  - {name: brightness, value: -30}
+  - {name: brightness, value: -15}
+  - {name: brightness, value: 15}
+  - {name: brightness, value: 30}
+  - {name: contrast, value: 0.75}
+  - {name: contrast, value: 0.90}
+  - {name: contrast, value: 1.10}
+  - {name: contrast, value: 1.25}
+  - {name: blur, value: 0.5}
+  - {name: blur, value: 1.0}
+  - {name: blur, value: 1.5}
+  - {name: noise, value: 1}
+  - {name: noise, value: 3}
+  - {name: noise, value: 5}
+
