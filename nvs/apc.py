@@ -47,3 +47,27 @@ def spatial_consistency(
         cosine,
         torch.zeros_like(cosine),
     ).clamp(0.0, 1.0)
+def rho_gate(
+    rho: torch.Tensor,
+    threshold: float,
+    temperature: float,
+) -> torch.Tensor:
+    if float(temperature) <= 0.0:
+        raise ValueError("temperature must be positive")
+    return torch.sigmoid(
+        (rho.float() - float(threshold)) / float(temperature)
+    )
+
+
+def apc_residual_score(
+    parallel_norm: torch.Tensor,
+    perpendicular_norm: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    if parallel_norm.shape != perpendicular_norm.shape or gate.shape != parallel_norm.shape:
+        raise ValueError("parallel_norm, perpendicular_norm and gate must have equal shapes")
+    score_squared = (
+        perpendicular_norm.float().square()
+        + (1.0 - gate.float()) * parallel_norm.float().square()
+    )
+    return torch.sqrt(score_squared.clamp_min(0.0))
