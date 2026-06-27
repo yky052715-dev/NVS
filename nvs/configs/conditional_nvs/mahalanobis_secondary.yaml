@@ -1,0 +1,36 @@
+experiment: {output_dir: outputs/conditional_nvs/mahalanobis_secondary, seed: 42}
+core_experiment: {enabled: false}
+data:
+  categories: [bottle, metal_nut, grid, leather, screw]
+  input_size: 518
+  calibration_fraction: 0.20
+  nvs_fit_fraction_of_remainder: 0.30
+  num_workers: 4
+model: {name: dinov2_vits14, hub_dir: null, batch_size: 4}
+memory: {protocol: M_K10, candidate_size: 50000, query_chunk_size: 4096, bank_chunk_size: 8192}
+subspace: {rank: 8, prototypes: 128, prototype_selection: proto_by_mstar}
+calibration: {mad_epsilon: 1.0e-6, image_quantile: 0.95}
+metrics: {small_defect_area_fraction: 0.01}
+whitening:
+  mode: maha_select
+  rho: 0.99
+  lambda: 0.07
+  relative_floor: 1.0e-8
+  max_components: null
+fusion: {enabled: false}
+postprocess: {enabled: false}
+augmem: {enabled: false}
+fit_transforms:
+  - {name: brightness, value: -30}
+  - {name: brightness, value: -15}
+  - {name: brightness, value: 15}
+  - {name: brightness, value: 30}
+  - {name: contrast, value: 0.75}
+  - {name: contrast, value: 0.90}
+  - {name: contrast, value: 1.10}
+  - {name: contrast, value: 1.25}
+  - {name: blur, value: 0.5}
+  - {name: blur, value: 1.0}
+  - {name: blur, value: 1.5}
+  - {name: noise, value: 1}
+  - {name: noise, value: 3}
