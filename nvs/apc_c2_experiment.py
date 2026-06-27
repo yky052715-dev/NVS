@@ -262,12 +262,16 @@ def _calibrate_and_select(
         if row["identity_normal_fp"] <= r0_identity_fp + tolerance
     ]
     pool = feasible or candidate_rows
+    # Image-level FP is the primary normal-only objective. When candidates
+    # have the same FP, prefer the higher rho quantile so that C2 retains
+    # more anomaly evidence; tiny positive-area differences are only a
+    # final deterministic tie-breaker.
     selected = min(
         pool,
         key=lambda row: (
             row["known_transformed_normal_fp"],
-            row["known_transformed_positive_area"],
             -row["rho_quantile"],
+            row["known_transformed_positive_area"],
         ),
     )
     calibrations["C2_apc_rho"] = candidate_calibrations[
@@ -278,6 +282,7 @@ def _calibrate_and_select(
         "r0_identity_normal_fp": r0_identity_fp,
         "identity_fp_tolerance": tolerance,
         "selection_feasible": bool(feasible),
+        "selection_rule": "min_known_fp_then_max_rho_quantile_then_min_area",
     }
     return calibrations, selection, candidate_rows
 
