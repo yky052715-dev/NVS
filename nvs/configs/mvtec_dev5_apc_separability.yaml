@@ -1,0 +1,59 @@
+experiment:
+  output_dir: outputs/nvs/apc_separability_dev5_seed42
+  seed: 42
+
+data:
+  categories: [bottle, metal_nut, grid, leather, screw]
+  input_size: 518
+  calibration_fraction: 0.20
+  threshold_fit_fraction: 0.80
+  num_workers: 4
+
+model:
+  name: dinov2_vits14
+  hub_dir: null
+  batch_size: 4
+
+memory:
+  max_bank_size: 30000
+  query_chunk_size: 4096
+  bank_chunk_size: 8192
+
+calibration:
+  mad_epsilon: 1.0e-6
+  threshold_method: image_max_quantile
+  image_quantile: 0.95
+
+metrics:
+  small_defect_area_fraction: 0.01
+
+subspace:
+  nvs_rank: 32
+  feature_pca_rank: 16
+  max_delta_samples: 100000
+  max_feature_samples: 100000
+
+# Only known strengths are used to fit the NVS basis.
+transforms:
+  - {name: brightness, value: -15}
+  - {name: brightness, value: 15}
+  - {name: contrast, value: 0.90}
+  - {name: contrast, value: 1.10}
+  - {name: blur, value: 0.5}
+  - {name: blur, value: 1.0}
+  - {name: noise, value: 1}
+  - {name: noise, value: 3}
+
+apc_diagnostics:
+  defect_mask_threshold: 0.10
+  max_patch_rows_per_group: 50000
+  export_maps: true
+  separability_auc_min: 0.65
+  rho_median_margin_min: 0.05
+  unseen_strength_transforms:
+    - {name: brightness, value: -30}
+    - {name: brightness, value: 30}
+    - {name: contrast, value: 0.75}
+    - {name: contrast, value: 1.25}
+    - {name: blur, value: 1.5}
+    - {name: noise, value: 5}
