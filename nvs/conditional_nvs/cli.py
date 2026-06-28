@@ -26,6 +26,7 @@ from nvs.common import (
 )
 
 from .datasets import (
+    IMG_EXTS,
     RobustADRecord,
     assert_fit_records_source_only,
     build_mvtec_dataset,
@@ -103,6 +104,149 @@ def _write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+
+_PERTURBED_INDEX_CACHE: dict[tuple[str, str, str], dict[str, Path]] = {}
+
+
+def _is_fit_transform(spec: dict[str, Any] | None) -> bool:
+    if spec is None:
+        return False
+    target = transform_name(dict(spec))
+    return target in {transform_name(dict(item)) for item in FIT_TRANSFORMS}
+
+
+def _record_category_and_relative(
+    record: ImageRecord, data_root: str | Path | None
+) -> tuple[str | None, Path | None]:
+    path = Path(record.path)
+    if data_root:
+        try:
+            relative = path.resolve().relative_to(Path(data_root).resolve())
+            if len(relative.parts) >= 2:
+                return relative.parts[0], Path(*relative.parts[1:])
+        except ValueError:
+            pass
+    parts = path.parts
+    for marker in ("train", "test"):
+        if marker in parts:
+            index = parts.index(marker)
+            if index > 0:
+                return parts[index - 1], Path(*parts[index:])
+    return None, None
+
+
+def _perturbed_index(root: Path, category: str, transform: str) -> dict[str, Path]:
+    key = (str(root), str(category), str(transform))
+    cached = _PERTURBED_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    directory = root / category / transform
+    index: dict[str, Path] = {}
+    if directory.is_dir():
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in IMG_EXTS:
+                continue
+            index.setdefault(path.name, path)
+            index.setdefault(path.stem, path)
+    _PERTURBED_INDEX_CACHE[key] = index
+    return index
+
+
+def _cached_transform_path(
+    record: ImageRecord,
+    config: dict[str, Any],
+    transform_spec: dict[str, Any],
+) -> tuple[Path | None, str | None, str | None]:
+    data_cfg = config.get("data", {}) or {}
+    root_value = data_cfg.get("perturbed_root")
+    if not root_value:
+        return None, None, None
+    root = Path(root_value)
+    category, relative = _record_category_and_relative(record, data_cfg.get("root"))
+    if category is None:
+        return None, None, None
+    transform = transform_name(transform_spec)
+    base = root / category / transform
+    original = Path(record.path)
+    candidates: list[Path] = []
+    if relative is not None:
+        candidates.append(base / relative)
+        candidates.append(base / relative.name)
+    candidates.extend(
+        [
+            base / "train" / "good" / original.name,
+            base / "good" / original.name,
+            base / original.name,
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate, category, transform
+    index = _perturbed_index(root, category, transform)
+    return index.get(original.name) or index.get(original.stem), category, transform
+
+
+def _records_from_perturbed_cache(
+    records: Sequence[ImageRecord],
+    config: dict[str, Any],
+    transform_spec: dict[str, Any] | None,
+) -> tuple[list[ImageRecord], dict[str, Any] | None, bool]:
+    if transform_spec is None:
+        return list(records), None, False
+    data_cfg = config.get("data", {}) or {}
+    require_fit = bool(data_cfg.get("require_perturbed_fit_transforms", False))
+    root_value = data_cfg.get("perturbed_root")
+    if not root_value:
+        if require_fit and _is_fit_transform(transform_spec):
+            raise FileNotFoundError(
+                "data.require_perturbed_fit_transforms=true but data.perturbed_root is not set"
+            )
+        return list(records), None, False
+
+    converted: list[ImageRecord] = []
+    missing: list[str] = []
+    category = transform = None
+    for record in records:
+        cached_path, record_category, record_transform = _cached_transform_path(
+            record, config, transform_spec
+        )
+        category = category or record_category
+        transform = transform or record_transform
+        if cached_path is None:
+            missing.append(str(record.path))
+            continue
+        converted.append(
+            ImageRecord(
+                path=cached_path,
+                label=int(record.label),
+                defect_type=str(record.defect_type),
+                mask_path=record.mask_path,
+            )
+        )
+
+    usage = {
+        "transform": transform_name(transform_spec),
+        "category": category,
+        "perturbed_root": str(root_value),
+        "records": len(records),
+        "hits": len(converted),
+        "misses": len(missing),
+        "used_cache": len(converted) == len(records),
+        "fallback_online": len(converted) != len(records),
+        "missing_examples": missing[:5],
+    }
+    config.setdefault("_perturbed_cache_usage", []).append(usage)
+    if len(converted) == len(records):
+        return converted, usage, True
+    if require_fit and _is_fit_transform(transform_spec):
+        raise FileNotFoundError(
+            "Missing cached perturbed images for fit transform "
+            f"{usage['transform']}: {len(missing)}/{len(records)} missing; "
+            f"examples={missing[:3]}"
+        )
+    return list(records), usage, False
+
+
 def _loader(
     records: Sequence[ImageRecord],
     config: dict[str, Any],
@@ -131,9 +275,13 @@ def _features(
     device: torch.device,
     transform_spec: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, int]:
+    feature_records, _, used_cache = _records_from_perturbed_cache(
+        records, config, transform_spec
+    )
+    effective_transform = None if used_cache else transform_spec
     values, _, grid_side = extract_features(
         model,
-        _loader(records, config, transform_spec, device=device),
+        _loader(feature_records, config, effective_transform, device=device),
         device,
         keep_on_device=device.type == "cuda",
     )
@@ -233,6 +381,7 @@ def _fit_category(
     category_dir: Path,
     category: str,
 ) -> tuple[ConditionalNVSPipeline, dict[str, Any], int]:
+    config["_perturbed_cache_usage"] = []
     split = split_three_way(
         train_records,
         split_seed=seed,
@@ -312,6 +461,11 @@ def _fit_category(
     sr_rows = pipeline.sr_weight_rows()
     if sr_rows:
         _write_csv(category_dir / "sr_cnvs_prototype_weights.csv", sr_rows)
+    if config.get("_perturbed_cache_usage"):
+        _save_json(
+            category_dir / "perturbed_cache_usage.json",
+            config.get("_perturbed_cache_usage", []),
+        )
     _save_json(
         category_dir / "calibration.json",
         {
@@ -409,6 +563,9 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
     categories = args.categories or config["data"]["categories"]
     output_dir = Path(args.output_dir or config["experiment"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    config.setdefault("data", {})["root"] = str(args.data_root)
+    if getattr(args, "perturbed_root", None):
+        config["data"]["perturbed_root"] = str(args.perturbed_root)
     config["experiment"]["seed"] = seed
     config["data"]["categories"] = list(categories)
     _save_json(output_dir / "resolved_config.json", config)
@@ -602,6 +759,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--config", required=True)
     run.add_argument("--dataset", choices=["mvtec", "robustad"], default="mvtec")
     run.add_argument("--data-root")
+    run.add_argument("--perturbed-root")
     run.add_argument("--manifest")
     run.add_argument("--categories", nargs="+")
     run.add_argument("--output-dir")

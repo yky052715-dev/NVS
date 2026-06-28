@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--dataset", choices=["mvtec", "robustad"], default="mvtec")
     parser.add_argument("--data-root")
+    parser.add_argument("--perturbed-root")
     parser.add_argument("--manifest")
     parser.add_argument("--categories", nargs="+")
     parser.add_argument("--output-dir")
@@ -36,6 +37,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = cli._load_config(args.config)
+    if args.perturbed_root:
+        config.setdefault("data", {})["perturbed_root"] = args.perturbed_root
     if args.memory_protocol:
         config["memory"]["protocol"] = args.memory_protocol
     if args.rank is not None:

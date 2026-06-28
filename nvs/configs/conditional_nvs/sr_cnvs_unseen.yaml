@@ -9,6 +9,8 @@ data:
   calibration_fraction: 0.20
   nvs_fit_fraction_of_remainder: 0.30
   num_workers: 4
+  perturbed_root: null
+  require_perturbed_fit_transforms: true
 model:
   name: dinov2_vits14
   hub_dir: null
