@@ -1,0 +1,81 @@
+experiment:
+  output_dir: outputs/conditional_nvs/d3_failure_diagnostics/seed42
+  seed: 42
+
+data:
+  categories: [bottle, metal_nut, grid, leather, screw]
+  input_size: 518
+  calibration_fraction: 0.20
+  nvs_fit_fraction_of_remainder: 0.30
+  num_workers: 4
+
+model:
+  name: dinov2_vits14
+  hub_dir: null
+  batch_size: 4
+
+memory:
+  protocol: M_K10  # The run script overrides this with the locked protocol.
+  candidate_size: 50000
+  query_chunk_size: 4096
+  bank_chunk_size: 8192
+
+subspace:
+  rank: 8
+  prototypes: 128
+  prototype_selection: proto_by_mstar
+
+calibration:
+  mad_epsilon: 1.0e-6
+  image_quantile: 0.95
+
+metrics:
+  small_defect_area_fraction: 0.01
+
+whitening:
+  mode: cosine
+  rho: 0.99
+  lambda: 0.07
+  relative_floor: 1.0e-8
+  max_components: null
+
+feature_cache:
+  # Optional read-only cache. Expected payload:
+  # {features: Tensor, grid_side: int, paths: [str, ...]}
+  root: null
+  read_only: true
+
+diagnostics:
+  reuse_core_output: outputs/conditional_nvs/core_proto128_r8
+  alphas: [0.5, 0.8, 1.0]
+  bootstrap_repeats: 5
+  bootstrap_fraction: 0.80
+  evidence_thresholds:
+    min_own_over_global: 0.02
+    min_own_over_wrong: 0.02
+    min_prototype_distance: 0.10
+    stability_ratio: 1.50
+    min_excess_defect_erasure: 0.02
+    min_alpha_recovery: 0.005
+    min_routing_disagreement: 0.10
+    min_routing_fp_gap: 0.01
+    min_prototype_fpr_std: 0.02
+
+fusion: {enabled: false}
+postprocess: {enabled: false}
+augmem: {enabled: false}
+
+fit_transforms:
+  - {name: brightness, value: -30}
+  - {name: brightness, value: -15}
+  - {name: brightness, value: 15}
+  - {name: brightness, value: 30}
+  - {name: contrast, value: 0.75}
+  - {name: contrast, value: 0.90}
+  - {name: contrast, value: 1.10}
+  - {name: contrast, value: 1.25}
+  - {name: blur, value: 0.5}
+  - {name: blur, value: 1.0}
+  - {name: blur, value: 1.5}
+  - {name: noise, value: 1}
+  - {name: noise, value: 3}
