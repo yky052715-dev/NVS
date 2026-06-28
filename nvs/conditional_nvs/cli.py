@@ -107,10 +107,16 @@ def _loader(
     records: Sequence[ImageRecord],
     config: dict[str, Any],
     transform_spec: dict[str, Any] | None = None,
+    device: torch.device | None = None,
 ) -> DataLoader:
+    batch_size = int(config["model"]["batch_size"])
+    if device is not None and device.type == "cuda":
+        batch_size = int(
+            config["model"].get("gpu_batch_size", max(batch_size, 16))
+        )
     return DataLoader(
         _Dataset(records, config["data"]["input_size"], transform_spec),
-        batch_size=int(config["model"]["batch_size"]),
+        batch_size=batch_size,
         shuffle=False,
         num_workers=int(config["data"].get("num_workers", 4)),
         pin_memory=torch.cuda.is_available(),
@@ -126,9 +132,12 @@ def _features(
     transform_spec: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, int]:
     values, _, grid_side = extract_features(
-        model, _loader(records, config, transform_spec), device
+        model,
+        _loader(records, config, transform_spec, device=device),
+        device,
+        keep_on_device=device.type == "cuda",
     )
-    return values.float().cpu(), int(grid_side)
+    return values.float(), int(grid_side)
 
 
 def _masks_and_labels(
@@ -147,7 +156,11 @@ def _masks_and_labels(
     return np.stack(masks), np.asarray(labels, dtype=np.int64)
 
 
-def _pipeline(config: dict[str, Any], seed: int) -> ConditionalNVSPipeline:
+def _pipeline(
+    config: dict[str, Any],
+    seed: int,
+    device: torch.device | str | None = None,
+) -> ConditionalNVSPipeline:
     memory = config["memory"]
     protocol = str(memory.get("protocol", "M_K30"))
     if protocol not in MEMORY_PROTOCOLS:
@@ -155,6 +168,16 @@ def _pipeline(config: dict[str, Any], seed: int) -> ConditionalNVSPipeline:
     strategy, capacity = MEMORY_PROTOCOLS[protocol]
     subspace = config["subspace"]
     whitening = config.get("whitening", {}) or {}
+    compute_device = torch.device(device or "cpu")
+    query_chunk_size = int(memory.get("query_chunk_size", 4096))
+    bank_chunk_size = int(memory.get("bank_chunk_size", 8192))
+    if compute_device.type == "cuda":
+        query_chunk_size = int(
+            memory.get("gpu_query_chunk_size", max(query_chunk_size, 16_384))
+        )
+        bank_chunk_size = int(
+            memory.get("gpu_bank_chunk_size", max(bank_chunk_size, 32_768))
+        )
     return ConditionalNVSPipeline(
         rank=int(subspace.get("rank", 8)),
         prototypes=int(subspace.get("prototypes", 128)),
@@ -165,8 +188,9 @@ def _pipeline(config: dict[str, Any], seed: int) -> ConditionalNVSPipeline:
             subspace.get("prototype_selection", "proto_by_mstar")
         ),
         search_mode=str(whitening.get("mode", "cosine")),
-        query_chunk_size=int(memory.get("query_chunk_size", 4096)),
-        bank_chunk_size=int(memory.get("bank_chunk_size", 8192)),
+        query_chunk_size=query_chunk_size,
+        bank_chunk_size=bank_chunk_size,
+        compute_device=compute_device,
         whitener_rho=float(whitening.get("rho", 0.99)),
         whitener_shrinkage=float(whitening.get("lambda", 0.07)),
         whitener_relative_floor=float(whitening.get("relative_floor", 1.0e-8)),
@@ -228,7 +252,7 @@ def _fit_category(
                 )
             ],
         )
-    pipeline = _pipeline(config, seed).fit(
+    pipeline = _pipeline(config, seed, device).fit(
         FeatureSplit(
             memory=memory_features,
             nvs_fit_original=nvs_original,
@@ -250,7 +274,12 @@ def _fit_category(
         )
         for alpha in fusion.get("alphas", [0.25]):
             method = f"F_D3_D0_alpha{float(alpha):.2f}"
-            fused = pipeline.fuse(normalized_calibration, float(alpha)).numpy()
+            fused = (
+                pipeline.fuse(normalized_calibration, float(alpha))
+                .detach()
+                .cpu()
+                .numpy()
+            )
             image_max = fused.reshape(fused.shape[0], -1).max(axis=1)
             threshold = float(
                 np.quantile(
@@ -292,8 +321,12 @@ def _evaluate_records(
     features, grid_side = _features(
         records, config, model, device, transform_spec=transform_spec
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     start = perf_counter()
     normalized = pipeline.normalize_scores(pipeline.score_patch_features(features))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     elapsed = perf_counter() - start
     labels = np.asarray([int(record.label) for record in records], dtype=np.int64)
     masks = None
@@ -312,7 +345,7 @@ def _evaluate_records(
             patch_scores,
             grid_side=grid_side,
             output_size=int(config["data"]["input_size"]),
-        ).numpy()
+        ).detach().cpu().numpy()
         calibration = (
             pipeline.calibrations[method]
             if method in pipeline.calibrations

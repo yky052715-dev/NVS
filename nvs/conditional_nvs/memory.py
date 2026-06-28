@@ -78,13 +78,13 @@ def greedy_kcenter_indices(
     approximation used inside the 30k merge-reduce path.
     """
 
-    values = values.float().cpu().contiguous()
+    values = values.float().contiguous()
     n = int(values.shape[0])
     k = min(max(1, int(k)), n)
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     first = int(torch.randint(n, (1,), generator=generator).item())
     selected = [first]
-    selected_mask = torch.zeros(n, dtype=torch.bool)
+    selected_mask = torch.zeros(n, dtype=torch.bool, device=values.device)
     selected_mask[first] = True
     min_distances = _squared_euclidean_to_centers(
         values, values[first : first + 1], chunk_size
@@ -97,12 +97,12 @@ def greedy_kcenter_indices(
         candidates = candidates[~selected_mask[candidates]]
         if candidates.numel() == 0:
             candidates = torch.nonzero(~selected_mask, as_tuple=True)[0][:count]
-        selected.extend(candidates.tolist())
+        selected.extend(candidates.detach().cpu().tolist())
         selected_mask[candidates] = True
         update = _squared_euclidean_to_centers(values, values[candidates], chunk_size)
         min_distances = torch.minimum(min_distances, update)
         min_distances[selected_mask] = -1.0
-    return torch.tensor(selected[:k], dtype=torch.long)
+    return torch.tensor(selected[:k], dtype=torch.long, device="cpu")
 
 
 def merge_reduce_kcenter_indices(
@@ -121,7 +121,7 @@ def merge_reduce_kcenter_indices(
     compressed to K with batched farthest-first updates.
     """
 
-    values = values.float().cpu().contiguous()
+    values = values.float().contiguous()
     n = int(values.shape[0])
     k = min(max(1, int(k)), n)
     if k == n:
@@ -150,7 +150,7 @@ def merge_reduce_kcenter_indices(
         )
         return torch.cat([merged, missing[: k - merged.numel()]])
     final_local = greedy_kcenter_indices(
-        values[merged],
+        values[merged.to(values.device, non_blocking=True)],
         k,
         seed=int(seed) + 1_000_003,
         chunk_size=chunk_size,
@@ -171,7 +171,7 @@ def build_memory(
     large_k_batch_select: int = 64,
 ) -> MemoryBuildResult:
     flat = F.normalize(
-        features.reshape(-1, features.shape[-1]).float().cpu(), dim=-1
+        features.reshape(-1, features.shape[-1]).float(), dim=-1
     ).contiguous()
     n = int(flat.shape[0])
     if n == 0:
@@ -220,7 +220,7 @@ def build_memory(
         elif strategy == "kcenter":
             batch_select = 1 if target <= 10_000 else large_k_batch_select
             local = greedy_kcenter_indices(
-                flat[candidates],
+                flat[candidates.to(flat.device, non_blocking=True)],
                 target,
                 seed=seed,
                 chunk_size=chunk_size,
@@ -231,7 +231,7 @@ def build_memory(
             raise ValueError(f"Unsupported memory strategy: {strategy}")
         selected = candidates[local]
     return MemoryBuildResult(
-        memory_bank=flat[selected].contiguous(),
+        memory_bank=flat[selected.to(flat.device, non_blocking=True)].contiguous(),
         candidate_indices=candidates.contiguous(),
         selected_memory_indices=selected.contiguous(),
         strategy=strategy,

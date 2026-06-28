@@ -143,7 +143,7 @@ def explained_energy(
     """Return ||U^T x||^2 / (||x||^2 + eps) for row-oriented U."""
 
     values = values.float()
-    basis = basis.float()
+    basis = basis.float().to(values.device, non_blocking=True)
     coefficients = values @ basis.T
     numerator = coefficients.square().sum(dim=-1)
     denominator = values.square().sum(dim=-1) + float(eps)
@@ -157,8 +157,8 @@ def conditional_explained_energy(
     eps: float = EPS,
 ) -> torch.Tensor:
     flat = values.reshape(-1, values.shape[-1]).float()
-    ids = prototype_ids.reshape(-1).long()
-    selected = bases.float()[ids]
+    ids = prototype_ids.reshape(-1).long().to(flat.device, non_blocking=True)
+    selected = bases.float().to(flat.device, non_blocking=True)[ids]
     coefficients = torch.einsum("nd,nrd->nr", flat, selected)
     numerator = coefficients.square().sum(dim=-1)
     denominator = flat.square().sum(dim=-1) + float(eps)
@@ -176,7 +176,8 @@ def partial_residual_norm(
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be in [0, 1]")
     values = values.float()
-    projected = (values @ basis.float().T) @ basis.float()
+    basis = basis.float().to(values.device, non_blocking=True)
+    projected = (values @ basis.T) @ basis
     return torch.linalg.norm(values - alpha * projected, dim=-1)
 
 
@@ -190,8 +191,8 @@ def conditional_partial_residual_norm(
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be in [0, 1]")
     flat = values.reshape(-1, values.shape[-1]).float()
-    ids = prototype_ids.reshape(-1).long()
-    selected = bases.float()[ids]
+    ids = prototype_ids.reshape(-1).long().to(flat.device, non_blocking=True)
+    selected = bases.float().to(flat.device, non_blocking=True)[ids]
     coefficients = torch.einsum("nd,nrd->nr", flat, selected)
     projected = torch.einsum("nr,nrd->nd", coefficients, selected)
     result = torch.linalg.norm(flat - alpha * projected, dim=-1)
@@ -207,6 +208,7 @@ def wrong_prototype_ids(
 
     if int(prototype_count) < 2:
         raise ValueError("wrong-prototype control requires at least two prototypes")
+    output_device = own_ids.device
     ids = own_ids.long().cpu()
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     offsets = torch.randint(
@@ -216,7 +218,9 @@ def wrong_prototype_ids(
         generator=generator,
         dtype=torch.long,
     )
-    return (ids + offsets) % int(prototype_count)
+    return ((ids + offsets) % int(prototype_count)).to(
+        output_device, non_blocking=True
+    )
 
 
 def routing_agreement(left: torch.Tensor, right: torch.Tensor) -> float:
@@ -265,7 +269,7 @@ def projector_distance(reference: torch.Tensor, candidate: torch.Tensor) -> floa
     """Normalized projector distance ||UU^T-VV^T||F/sqrt(2r)."""
 
     reference = reference.float()
-    candidate = candidate.float()
+    candidate = candidate.float().to(reference.device, non_blocking=True)
     if reference.ndim != 2 or candidate.ndim != 2:
         raise ValueError("Bases must have shape [rank, dimension]")
     if reference.shape != candidate.shape:
@@ -297,7 +301,7 @@ def fit_uncentered_basis_covariance(
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     order = torch.argsort(eigenvalues, descending=True)
     effective_rank = min(max(1, int(rank)), values.shape[1])
-    return eigenvectors[:, order[:effective_rank]].T.float().cpu().contiguous()
+    return eigenvectors[:, order[:effective_rank]].T.float().contiguous()
 
 def safe_correlation(left: Sequence[float], right: Sequence[float]) -> float:
     x = np.asarray(left, dtype=np.float64)
@@ -368,7 +372,13 @@ def basis_stability_rows(
     rank = int(model.rank)
     for repeat in range(int(repeats)):
         sampled = sample_image_ids(image_ids, fraction, int(seed) + repeat)
-        patch_mask = _mask_from_ids(image_ids.long().cpu(), sampled)
+        patch_mask = _mask_from_ids(
+            image_ids.long().cpu(), sampled
+        ).to(deltas.device, non_blocking=True)
+        image_ids_device = image_ids.long().to(deltas.device, non_blocking=True)
+        prototype_ids_device = prototype_ids.long().to(
+            deltas.device, non_blocking=True
+        )
         global_basis = fit_uncentered_basis_covariance(
             deltas[patch_mask].reshape(-1, deltas.shape[-1]),
             rank,
@@ -388,8 +398,8 @@ def basis_stability_rows(
             }
         )
         for prototype in range(model.centers.shape[0]):
-            members = patch_mask & (prototype_ids.long().cpu() == prototype)
-            unique_images = torch.unique(image_ids[members]).numel()
+            members = patch_mask & (prototype_ids_device == prototype)
+            unique_images = torch.unique(image_ids_device[members]).numel()
             valid = (
                 int(members.sum()) >= rank
                 and int(unique_images) >= 2
@@ -605,7 +615,10 @@ def _cached_or_extract(
             expected_paths = [str(record.path) for record in records]
             if payload.get("paths") != expected_paths:
                 raise RuntimeError(f"Feature cache path mismatch: {cache_path}")
-            return payload["features"].float().cpu(), int(payload["grid_side"])
+            return (
+                payload["features"].float().to(device, non_blocking=True),
+                int(payload["grid_side"]),
+            )
     return _features(records, config, model, device, transform_spec)
 
 
@@ -1648,9 +1661,11 @@ def _run(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         f"Invalid core selected_memory_indices for {category}"
                     )
-                pipeline_memory = flat_memory[selected]
+                pipeline_memory = flat_memory[
+                    selected.to(flat_memory.device, non_blocking=True)
+                ]
                 reused_core_memory = True
-        pipeline = _pipeline(config, seed)
+        pipeline = _pipeline(config, seed, device)
         if reused_core_memory:
             # The selected entries and their order are identical to the core run;
             # only the expensive k-center reconstruction is skipped.
@@ -1667,19 +1682,19 @@ def _run(args: argparse.Namespace) -> None:
                     nvs_fit_transformed=nvs_transformed,
                 )
             )
-        normalized_nvs = F.normalize(nvs_original.float().cpu(), dim=-1)
+        normalized_nvs = F.normalize(nvs_original.float(), dim=-1)
         flat_nvs = normalized_nvs.reshape(-1, normalized_nvs.shape[-1])
         nvs_deltas = torch.stack(
             [
-                F.normalize(values.float().cpu(), dim=-1).reshape_as(flat_nvs)
+                F.normalize(values.float(), dim=-1).reshape_as(flat_nvs)
                 - flat_nvs
                 for values in nvs_transformed
             ],
             dim=1,
         )
-        nvs_image_ids = torch.arange(nvs_original.shape[0]).repeat_interleave(
-            nvs_original.shape[1]
-        )
+        nvs_image_ids = torch.arange(
+            nvs_original.shape[0], device=nvs_original.device
+        ).repeat_interleave(nvs_original.shape[1])
         with _StageTimer(f"{category}: basis stability bootstrap", device):
             stability_rows = basis_stability_rows(
                 nvs_deltas,

@@ -46,13 +46,13 @@ def spherical_kmeans(
     max_iter: int = 50,
     tolerance: float = 1.0e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    values = F.normalize(values.reshape(-1, values.shape[-1]).float().cpu(), dim=-1)
+    values = F.normalize(values.reshape(-1, values.shape[-1]).float(), dim=-1)
     n = int(values.shape[0])
     k = min(max(1, int(clusters)), n)
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
-    initial = torch.randperm(n, generator=generator)[:k]
+    initial = torch.randperm(n, generator=generator)[:k].to(values.device)
     centers = values[initial].clone()
-    labels = torch.full((n,), -1, dtype=torch.long)
+    labels = torch.full((n,), -1, dtype=torch.long, device=values.device)
     for _ in range(int(max_iter)):
         new_labels = (values @ centers.T).argmax(dim=1)
         new_centers = torch.zeros_like(centers)
@@ -73,8 +73,12 @@ def spherical_kmeans(
 
 
 def assign_prototypes(values: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
-    normalized = F.normalize(values.reshape(-1, values.shape[-1]).float().cpu(), dim=-1)
-    return (normalized @ F.normalize(centers.float().cpu(), dim=-1).T).argmax(dim=1)
+    device = values.device
+    normalized = F.normalize(values.reshape(-1, values.shape[-1]).float(), dim=-1)
+    normalized_centers = F.normalize(
+        centers.float().to(device, non_blocking=True), dim=-1
+    )
+    return (normalized @ normalized_centers.T).argmax(dim=1)
 
 
 def fit_prototype_model(
@@ -92,9 +96,10 @@ def fit_prototype_model(
     identifies the source image of each original patch.
     """
 
-    originals = F.normalize(original_features.float().cpu(), dim=-1)
-    deltas = deltas.float().cpu()
-    image_ids = image_ids.long().cpu()
+    device = original_features.device
+    originals = F.normalize(original_features.float(), dim=-1)
+    deltas = deltas.float().to(device, non_blocking=True)
+    image_ids = image_ids.long().to(device, non_blocking=True)
     if originals.ndim != 2 or deltas.ndim != 3:
         raise ValueError("Expected originals [N,D] and deltas [N,T,D]")
     if originals.shape[0] != deltas.shape[0] or image_ids.numel() != originals.shape[0]:
@@ -109,9 +114,9 @@ def fit_prototype_model(
     k = int(centers.shape[0])
     feature_bases: list[torch.Tensor] = []
     delta_bases: list[torch.Tensor] = []
-    fallback = torch.zeros(k, dtype=torch.bool)
-    patch_counts = torch.zeros(k, dtype=torch.long)
-    image_counts = torch.zeros(k, dtype=torch.long)
+    fallback = torch.zeros(k, dtype=torch.bool, device=device)
+    patch_counts = torch.zeros(k, dtype=torch.long, device=device)
+    image_counts = torch.zeros(k, dtype=torch.long, device=device)
     minimum_patches = max(8 * int(rank), 64)
     for prototype in range(k):
         members = torch.nonzero(labels == prototype, as_tuple=True)[0]
@@ -146,7 +151,8 @@ def fit_prototype_model(
 
 
 def prototype_by_mstar(memory_prototype_ids: torch.Tensor, nn_indices: torch.Tensor) -> torch.Tensor:
-    return memory_prototype_ids.long().cpu()[nn_indices.long().cpu()]
+    device = nn_indices.device
+    return memory_prototype_ids.long().to(device, non_blocking=True)[nn_indices.long()]
 
 
 def prototype_by_topk_vote_k5(
@@ -154,25 +160,24 @@ def prototype_by_topk_vote_k5(
 ) -> torch.Tensor:
     if topk_indices.shape[-1] != 5:
         raise ValueError("topk vote protocol is fixed to k=5")
-    votes = memory_prototype_ids.long().cpu()[topk_indices.long().cpu()]
+    device = topk_indices.device
+    memory_ids = memory_prototype_ids.long().to(device, non_blocking=True)
+    votes = memory_ids[topk_indices.long()]
     flat = votes.reshape(-1, 5)
-    winners = []
-    for row in flat:
-        counts = torch.bincount(row)
-        winners.append(int(torch.nonzero(counts == counts.max(), as_tuple=True)[0][0]))
-    return torch.tensor(winners, dtype=torch.long).reshape(votes.shape[:-1])
+    prototype_count = max(1, int(memory_ids.max().item()) + 1)
+    counts = F.one_hot(flat, num_classes=prototype_count).sum(dim=1)
+    return counts.argmax(dim=1).reshape(votes.shape[:-1])
 
 
 def conditional_residual(
     deviation: torch.Tensor, bases: torch.Tensor, prototype_ids: torch.Tensor
 ) -> torch.Tensor:
-    flat = deviation.reshape(-1, deviation.shape[-1]).float().cpu()
-    ids = prototype_ids.reshape(-1).long().cpu()
-    output = torch.empty(flat.shape[0], dtype=torch.float32)
-    for prototype in torch.unique(ids).tolist():
-        mask = ids == int(prototype)
-        output[mask] = residual_norm(flat[mask], bases[int(prototype)])
-    return output.reshape(deviation.shape[:-1])
+    flat = deviation.reshape(-1, deviation.shape[-1]).float()
+    ids = prototype_ids.reshape(-1).long().to(flat.device, non_blocking=True)
+    selected = bases.float().to(flat.device, non_blocking=True)[ids]
+    coefficients = torch.einsum("nd,nrd->nr", flat, selected)
+    projected = torch.einsum("nr,nrd->nd", coefficients, selected)
+    return torch.linalg.norm(flat - projected, dim=-1).reshape(deviation.shape[:-1])
 
 
 def score_conditional_deviation(

@@ -201,13 +201,18 @@ def collate_records(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @torch.inference_mode()
-def extract_features(model, loader, device: torch.device) -> tuple[torch.Tensor, list[str], int]:
+def extract_features(
+    model,
+    loader,
+    device: torch.device,
+    keep_on_device: bool = False,
+) -> tuple[torch.Tensor, list[str], int]:
     chunks: list[torch.Tensor] = []
     paths: list[str] = []
     grid_side = 0
     for batch in loader:
         features, grid_side = extract_patch_tokens(model, batch["image"], device)
-        chunks.append(features.cpu())
+        chunks.append(features if keep_on_device else features.cpu())
         paths.extend(batch["path"])
     return torch.cat(chunks, dim=0), paths, int(grid_side)
 

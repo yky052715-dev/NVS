@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nvs.conditional_nvs.pipeline import (
@@ -47,3 +48,29 @@ def test_top5_prototype_selection_smoke() -> None:
     ).fit(_fixture())
     scores = pipeline.score_patch_features(torch.randn(2, 3, 4))
     assert scores["D3_NVSProto"].shape == (2, 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_pipeline_keeps_heavy_state_and_scores_on_gpu() -> None:
+    pipeline = ConditionalNVSPipeline(
+        rank=1,
+        prototypes=2,
+        memory_strategy="full",
+        memory_capacity=0,
+        seed=42,
+        compute_device="cuda",
+        query_chunk_size=64,
+        bank_chunk_size=64,
+    ).fit(_fixture())
+    query = torch.randn(2, 3, 4)
+    scores = pipeline.score_patch_features(query)
+    pipeline.calibrate(query)
+    normalized = pipeline.normalize_scores(scores)
+
+    assert pipeline.memory_result is not None
+    assert pipeline.prototype_model is not None
+    assert pipeline.memory_result.memory_bank.is_cuda
+    assert pipeline.prototype_model.centers.is_cuda
+    assert pipeline.prototype_model.delta_bases.is_cuda
+    assert all(value.is_cuda and torch.isfinite(value).all() for value in scores.values())
+    assert all(value.is_cuda for value in normalized.values())

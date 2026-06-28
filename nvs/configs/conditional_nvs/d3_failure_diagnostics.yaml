@@ -13,12 +13,15 @@ model:
   name: dinov2_vits14
   hub_dir: null
   batch_size: 4
+  gpu_batch_size: 16
 
 memory:
   protocol: M_K10  # The run script overrides this with the locked protocol.
   candidate_size: 50000
   query_chunk_size: 4096
   bank_chunk_size: 8192
+  gpu_query_chunk_size: 16384
+  gpu_bank_chunk_size: 32768
 
 subspace:
   rank: 8

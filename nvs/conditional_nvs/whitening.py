@@ -19,10 +19,14 @@ class Whitener:
 
     def transform(self, values: torch.Tensor) -> torch.Tensor:
         shape = values.shape
-        flat = values.reshape(-1, shape[-1]).float().cpu()
-        reduced = (flat - self.reducer_mean) @ self.reducer_components.T
+        device = values.device
+        flat = values.reshape(-1, shape[-1]).float()
+        mean = self.reducer_mean.to(device, non_blocking=True)
+        components = self.reducer_components.to(device, non_blocking=True)
+        cholesky = self.cholesky.to(device, non_blocking=True)
+        reduced = (flat - mean) @ components.T
         whitened = torch.linalg.solve_triangular(
-            self.cholesky, reduced.T, upper=False
+            cholesky, reduced.T, upper=False
         ).T
         return whitened.reshape(*shape[:-1], -1)
 
@@ -47,7 +51,8 @@ def fit_whitener(
     relative_floor: float = 1.0e-8,
     max_components: int | None = None,
 ) -> Whitener:
-    values = candidate_features.reshape(-1, candidate_features.shape[-1]).double().cpu()
+    values = candidate_features.reshape(-1, candidate_features.shape[-1]).double()
+    device = values.device
     if values.shape[0] < 2:
         raise ValueError("At least two candidate features are required")
     mean = values.mean(dim=0)
@@ -62,7 +67,11 @@ def fit_whitener(
         component_count = 1
     else:
         cumulative = torch.cumsum(eigenvalues, dim=0) / total
-        component_count = int(torch.searchsorted(cumulative, torch.tensor(float(rho))).item()) + 1
+        component_count = int(
+            torch.searchsorted(
+                cumulative, torch.tensor(float(rho), device=device, dtype=cumulative.dtype)
+            ).item()
+        ) + 1
     if max_components is not None:
         component_count = min(component_count, int(max_components))
     components = eigenvectors[:, :component_count].T.contiguous()
@@ -71,12 +80,14 @@ def fit_whitener(
     covariance_mean = float(torch.trace(reduced_covariance) / component_count)
     shrunk = (1.0 - float(shrinkage)) * reduced_covariance + float(
         shrinkage
-    ) * covariance_mean * torch.eye(component_count, dtype=torch.float64)
+    ) * covariance_mean * torch.eye(
+        component_count, dtype=torch.float64, device=device
+    )
     floor = float(relative_floor) * max(abs(covariance_mean), 1.0e-12)
     evals, evecs = torch.linalg.eigh(shrunk)
     shrunk = (evecs * evals.clamp_min(floor).unsqueeze(0)) @ evecs.T
     jitter = 0.0
-    identity = torch.eye(component_count, dtype=torch.float64)
+    identity = torch.eye(component_count, dtype=torch.float64, device=device)
     attempt = 0.0
     while True:
         try:

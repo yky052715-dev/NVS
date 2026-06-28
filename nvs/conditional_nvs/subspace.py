@@ -8,7 +8,7 @@ def _validate(values: torch.Tensor, rank: int) -> tuple[torch.Tensor, int]:
         raise ValueError("values must have shape [N, D]")
     if values.shape[0] < 1 or values.shape[1] < 1:
         raise ValueError("values must be non-empty")
-    return values.float().cpu(), min(max(1, int(rank)), min(values.shape))
+    return values.float(), min(max(1, int(rank)), min(values.shape))
 
 
 def fit_centered_basis(
@@ -29,7 +29,9 @@ def fit_uncentered_basis(values: torch.Tensor, rank: int) -> torch.Tensor:
 
 
 def projection(values: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-    return (values.float() @ basis.float().T) @ basis.float()
+    values = values.float()
+    basis = basis.float().to(values.device, non_blocking=True)
+    return (values @ basis.T) @ basis
 
 
 def residual_norm(values: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:

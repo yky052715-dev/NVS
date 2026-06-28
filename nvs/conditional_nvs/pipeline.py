@@ -47,14 +47,18 @@ def _cosine_topk(
     query_chunk_size: int,
     bank_chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    queries = F.normalize(queries.float().cpu(), dim=-1)
-    bank = F.normalize(bank.float().cpu(), dim=-1)
+    queries = F.normalize(queries.float(), dim=-1)
+    bank = F.normalize(bank.float().to(queries.device, non_blocking=True), dim=-1)
     k = min(int(k), bank.shape[0])
     all_values, all_indices = [], []
     for start in range(0, queries.shape[0], int(query_chunk_size)):
         query = queries[start : start + int(query_chunk_size)]
-        values = torch.full((query.shape[0], k), -float("inf"))
-        indices = torch.full((query.shape[0], k), -1, dtype=torch.long)
+        values = torch.full(
+            (query.shape[0], k), -float("inf"), device=queries.device
+        )
+        indices = torch.full(
+            (query.shape[0], k), -1, dtype=torch.long, device=queries.device
+        )
         for bank_start in range(0, bank.shape[0], int(bank_chunk_size)):
             similarity = query @ bank[bank_start : bank_start + int(bank_chunk_size)].T
             local_k = min(k, similarity.shape[1])
@@ -75,13 +79,18 @@ def _euclidean_topk(
     query_chunk_size: int,
     bank_chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    queries, bank = queries.float().cpu(), bank.float().cpu()
+    queries = queries.float()
+    bank = bank.float().to(queries.device, non_blocking=True)
     k = min(int(k), bank.shape[0])
     all_values, all_indices = [], []
     for start in range(0, queries.shape[0], int(query_chunk_size)):
         query = queries[start : start + int(query_chunk_size)]
-        values = torch.full((query.shape[0], k), float("inf"))
-        indices = torch.full((query.shape[0], k), -1, dtype=torch.long)
+        values = torch.full(
+            (query.shape[0], k), float("inf"), device=queries.device
+        )
+        indices = torch.full(
+            (query.shape[0], k), -1, dtype=torch.long, device=queries.device
+        )
         for bank_start in range(0, bank.shape[0], int(bank_chunk_size)):
             block = bank[bank_start : bank_start + int(bank_chunk_size)]
             distances = torch.cdist(query, block).square()
@@ -114,9 +123,10 @@ def _fit_model_in_appearance_space(
     global_delta = fit_uncentered_basis(deltas.reshape(-1, deltas.shape[-1]), rank)
     minimum = max(8 * int(rank), 64)
     feature_bases, delta_bases = [], []
-    fallback = torch.zeros(centers.shape[0], dtype=torch.bool)
-    patch_counts = torch.zeros(centers.shape[0], dtype=torch.long)
-    image_counts = torch.zeros(centers.shape[0], dtype=torch.long)
+    device = originals.device
+    fallback = torch.zeros(centers.shape[0], dtype=torch.bool, device=device)
+    patch_counts = torch.zeros(centers.shape[0], dtype=torch.long, device=device)
+    image_counts = torch.zeros(centers.shape[0], dtype=torch.long, device=device)
     for prototype in range(centers.shape[0]):
         members = torch.nonzero(labels == prototype, as_tuple=True)[0]
         patch_counts[prototype] = members.numel()
@@ -162,6 +172,7 @@ class ConditionalNVSPipeline:
         search_mode: str = "cosine",
         query_chunk_size: int = 4096,
         bank_chunk_size: int = 8192,
+        compute_device: str | torch.device | None = None,
         whitener_rho: float = 0.99,
         whitener_shrinkage: float = 0.07,
         whitener_relative_floor: float = 1.0e-8,
@@ -183,6 +194,9 @@ class ConditionalNVSPipeline:
         self.search_mode = search_mode
         self.query_chunk_size = int(query_chunk_size)
         self.bank_chunk_size = int(bank_chunk_size)
+        self.compute_device = torch.device(compute_device or "cpu")
+        if self.compute_device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA compute_device requested but CUDA is unavailable")
         self.whitener_rho = float(whitener_rho)
         self.whitener_shrinkage = float(whitener_shrinkage)
         self.whitener_relative_floor = float(whitener_relative_floor)
@@ -194,9 +208,10 @@ class ConditionalNVSPipeline:
         self.search_bank: torch.Tensor | None = None
         self.calibrations: dict[str, CalibrationState] = {}
 
-    @staticmethod
-    def _normalized(values: torch.Tensor) -> torch.Tensor:
-        return F.normalize(values.float().cpu(), dim=-1)
+    def _normalized(self, values: torch.Tensor) -> torch.Tensor:
+        return F.normalize(
+            values.float().to(self.compute_device, non_blocking=True), dim=-1
+        )
 
     def fit(self, features: FeatureSplit) -> "ConditionalNVSPipeline":
         memory_features = self._normalized(features.memory).reshape(
@@ -218,9 +233,9 @@ class ConditionalNVSPipeline:
             ],
             dim=1,
         )
-        image_ids = torch.arange(originals_3d.shape[0]).repeat_interleave(
-            int(originals_3d.shape[1])
-        )
+        image_ids = torch.arange(
+            originals_3d.shape[0], device=self.compute_device
+        ).repeat_interleave(int(originals_3d.shape[1]))
 
         candidate_indices = None
         memory_for_selection = memory_features
@@ -233,7 +248,9 @@ class ConditionalNVSPipeline:
             )
             candidate_indices = provisional.candidate_indices
             self.whitener = fit_whitener(
-                memory_features[candidate_indices],
+                memory_features[
+                    candidate_indices.to(self.compute_device, non_blocking=True)
+                ],
                 rho=self.whitener_rho,
                 shrinkage=self.whitener_shrinkage,
                 relative_floor=self.whitener_relative_floor,
@@ -251,7 +268,9 @@ class ConditionalNVSPipeline:
         )
         self.memory_result = MemoryBuildResult(
             memory_bank=memory_features[
-                selected_result.selected_memory_indices
+                selected_result.selected_memory_indices.to(
+                    self.compute_device, non_blocking=True
+                )
             ].contiguous(),
             candidate_indices=selected_result.candidate_indices,
             selected_memory_indices=selected_result.selected_memory_indices,
@@ -337,7 +356,9 @@ class ConditionalNVSPipeline:
                 self.bank_chunk_size,
             )
             d0 = nearest_values[:, 0].sqrt()
-        nearest = self.memory_result.memory_bank[nearest_indices[:, 0]]
+        nearest = self.memory_result.memory_bank[
+            nearest_indices[:, 0].to(self.memory_result.memory_bank.device)
+        ]
         deviation = query - nearest
         if self.prototype_selection == "proto_by_mstar":
             prototype_ids = prototype_by_mstar(
@@ -372,7 +393,7 @@ class ConditionalNVSPipeline:
         raw = self.score_patch_features(calibration_features)
         self.calibrations = {
             method: fit_calibration(
-                values.numpy(),
+                values.detach().cpu().numpy(),
                 image_quantile=image_quantile,
                 mad_epsilon=mad_epsilon,
                 scope="identity_calibration",
@@ -388,8 +409,10 @@ class ConditionalNVSPipeline:
             raise RuntimeError("Independent calibration is required for every method")
         return {
             method: torch.from_numpy(
-                self.calibrations[method].normalize(values.numpy())
-            ).float()
+                self.calibrations[method].normalize(
+                    values.detach().cpu().numpy()
+                )
+            ).to(values.device, non_blocking=True).float()
             for method, values in ((name, scores[name]) for name in CORE_METHODS)
         }
 
@@ -413,12 +436,13 @@ class ConditionalNVSPipeline:
             "prototypes": self.prototypes,
             "prototype_selection": self.prototype_selection,
             "search_mode": self.search_mode,
+            "compute_device": str(self.compute_device),
             "memory_entries": self.memory_result.capacity,
             "memory_strategy": self.memory_result.strategy,
             "memory_algorithm": self.memory_result.algorithm,
             "memory_build_seconds": self.memory_result.build_seconds,
-            "candidate_indices": self.memory_result.candidate_indices.tolist(),
-            "selected_memory_indices": self.memory_result.selected_memory_indices.tolist(),
+            "candidate_indices": self.memory_result.candidate_indices.detach().cpu().tolist(),
+            "selected_memory_indices": self.memory_result.selected_memory_indices.detach().cpu().tolist(),
             "prototype_statistics": self.prototype_model.statistics(),
             "whitener": None
             if self.whitener is None
