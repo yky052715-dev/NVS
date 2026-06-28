@@ -39,20 +39,22 @@ def _stats(
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     distances, indices = nearest_with_indices(
-        features.cpu(),
+        features,
         state["memory_bank"],
         query_chunk_size=int(config["memory"]["query_chunk_size"]),
         bank_chunk_size=int(config["memory"]["bank_chunk_size"]),
         device=device,
     )
     b, p, d = features.shape
-    nearest = state["memory_bank"][indices.reshape(-1)].reshape(b, p, d)
-    decomposition = decompose_deviation(
-        features.cpu().float() - nearest.float(),
-        state["nvs_basis"],
+    nearest = state["memory_bank"][indices.reshape(-1)].reshape(b, p, d).to(
+        device,
+        non_blocking=True,
     )
+    basis = state["nvs_basis"].to(device, non_blocking=True)
+    delta = features.to(device, non_blocking=True).float() - nearest.float()
+    decomposition = decompose_deviation(delta, basis)
     return {
-        "r0_nn_distance": distances.float(),
+        "r0_nn_distance": distances.to(device, non_blocking=True).float(),
         "parallel_norm": decomposition["parallel_norm"],
         "perpendicular_norm": decomposition["perpendicular_norm"],
         "total_norm": decomposition["total_norm"],

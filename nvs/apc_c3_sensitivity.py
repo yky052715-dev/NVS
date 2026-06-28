@@ -53,15 +53,17 @@ def _maps(
     tau_rho: float,
     tau_c_by_method: dict[str, float],
     config: dict[str, Any],
+    device: torch.device | None = None,
 ) -> dict[str, np.ndarray]:
     output_size = int(config["data"]["input_size"])
     rho_temperature = float(config["apc_c3"]["rho_temperature"])
     c_temperature = float(config["apc_c3"]["consistency_temperature"])
-    r0 = torch.from_numpy(scored["r0"])
-    parallel = torch.from_numpy(scored["parallel"])
-    perpendicular = torch.from_numpy(scored["perpendicular"])
-    rho = torch.from_numpy(scored["rho"])
-    consistency = torch.from_numpy(scored["consistency"])
+    map_device = device or torch.device("cpu")
+    r0 = torch.from_numpy(scored["r0"]).to(map_device, non_blocking=True)
+    parallel = torch.from_numpy(scored["parallel"]).to(map_device, non_blocking=True)
+    perpendicular = torch.from_numpy(scored["perpendicular"]).to(map_device, non_blocking=True)
+    rho = torch.from_numpy(scored["rho"]).to(map_device, non_blocking=True)
+    consistency = torch.from_numpy(scored["consistency"]).to(map_device, non_blocking=True)
     rho_strength = rho_gate(rho, tau_rho, rho_temperature)
     c2_score = apc_residual_score(
         parallel,
@@ -166,6 +168,7 @@ def _calibrate(
         tau_rho,
         tau_c_by_method,
         config,
+        device,
     )
     calibrations = {
         method: _fit_calibration(identity_maps[method], fit_indices, config)
@@ -175,7 +178,7 @@ def _calibrate(
         method: [] for method in _all_methods(config)
     }
     for scored in known_scores:
-        maps = _maps(scored, tau_rho, tau_c_by_method, config)
+        maps = _maps(scored, tau_rho, tau_c_by_method, config, device)
         for method, values in maps.items():
             known_by_method[method].append(values)
 
@@ -241,8 +244,9 @@ def _evaluate(
     tau_rho: float,
     tau_c_by_method: dict[str, float],
     config: dict[str, Any],
+    device: torch.device | None = None,
 ) -> list[dict[str, Any]]:
-    raw_maps = _maps(scored, tau_rho, tau_c_by_method, config)
+    raw_maps = _maps(scored, tau_rho, tau_c_by_method, config, device)
     masks = scored["masks"].astype(bool)
     labels = scored["labels"]
     c_quantiles = [
@@ -478,13 +482,14 @@ def main() -> None:
                     tau_rho,
                     tau_c_by_method,
                     config,
+                    device,
                 )
             )
-            write_csv(
-                rows,
-                output_dir / "category_condition_metrics.csv",
-            )
 
+    write_csv(
+        rows,
+        output_dir / "category_condition_metrics.csv",
+    )
     condition_rows = _mean_rows(rows, "condition")
     group_rows = _mean_rows(rows, "shift_group")
     write_csv(

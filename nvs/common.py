@@ -234,15 +234,39 @@ def nearest_with_indices(
         raise ValueError("query_features must have shape [B, P, C]")
     b, p, c = query_features.shape
     flat = query_features.reshape(-1, c).float()
-    memory = F.normalize(memory_bank.float().cpu(), dim=-1)
+    memory_cpu = F.normalize(memory_bank.float().cpu(), dim=-1)
+    memory_gpu: torch.Tensor | None = None
+    if torch.device(device).type == "cuda":
+        try:
+            # High-VRAM machines are much faster if the bank stays resident on
+            # GPU. The old path copied every bank chunk from CPU to GPU for
+            # every query chunk, which is painful on CPU-bound servers.
+            memory_gpu = memory_cpu.to(device, non_blocking=True)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            memory_gpu = None
+            torch.cuda.empty_cache()
     all_distances: list[torch.Tensor] = []
     all_indices: list[torch.Tensor] = []
     for query_start in range(0, flat.shape[0], int(query_chunk_size)):
-        query = flat[query_start : query_start + int(query_chunk_size)].to(device)
+        query = flat[query_start : query_start + int(query_chunk_size)].to(
+            device,
+            non_blocking=True,
+        )
         best_sim = torch.full((query.shape[0],), -float("inf"), device=device)
         best_idx = torch.full((query.shape[0],), -1, dtype=torch.long, device=device)
-        for bank_start in range(0, memory.shape[0], int(bank_chunk_size)):
-            bank = memory[bank_start : bank_start + int(bank_chunk_size)].to(device)
+        memory_rows = (
+            memory_gpu.shape[0] if memory_gpu is not None else memory_cpu.shape[0]
+        )
+        for bank_start in range(0, memory_rows, int(bank_chunk_size)):
+            if memory_gpu is None:
+                bank = memory_cpu[bank_start : bank_start + int(bank_chunk_size)].to(
+                    device,
+                    non_blocking=True,
+                )
+            else:
+                bank = memory_gpu[bank_start : bank_start + int(bank_chunk_size)]
             similarity = query @ bank.T
             local_sim, local_idx = similarity.max(dim=1)
             update = local_sim > best_sim
