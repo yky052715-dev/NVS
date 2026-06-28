@@ -50,6 +50,7 @@ def _score_records(
     parallel_chunks: list[np.ndarray] = []
     perpendicular_chunks: list[np.ndarray] = []
     rho_chunks: list[np.ndarray] = []
+    consistency_chunks: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     labels: list[int] = []
     paths: list[str] = []
@@ -76,6 +77,7 @@ def _score_records(
         parallel_chunks.append(stats["parallel_norm"].cpu().numpy())
         perpendicular_chunks.append(stats["perpendicular_norm"].cpu().numpy())
         rho_chunks.append(stats["rho"].cpu().numpy())
+        consistency_chunks.append(stats["consistency"].cpu().numpy())
         labels.extend(int(value) for value in batch["label"].tolist())
         paths.extend(batch["path"])
         defect_types.extend(batch["defect_type"])
@@ -87,6 +89,7 @@ def _score_records(
         "parallel": np.concatenate(parallel_chunks),
         "perpendicular": np.concatenate(perpendicular_chunks),
         "rho": np.concatenate(rho_chunks),
+        "consistency": np.concatenate(consistency_chunks),
         "grid_side": int(grid_side),
         "labels": np.asarray(labels, dtype=np.int64),
         "masks": np.stack(masks) if include_mask else None,
