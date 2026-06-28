@@ -13,6 +13,7 @@ import json
 import math
 import random
 import subprocess
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -33,6 +34,105 @@ from .transforms import FIT_TRANSFORMS, transform_name
 
 
 EPS = 1.0e-12
+
+
+def _log(message: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[d3-diagnostics {stamp}] {message}", flush=True)
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+class _StageTimer:
+    def __init__(self, label: str, device: torch.device | None = None) -> None:
+        self.label = label
+        self.device = device
+        self.start = 0.0
+
+    def __enter__(self):
+        if self.device is not None:
+            _sync_if_cuda(self.device)
+        self.start = time.perf_counter()
+        _log(f"{self.label} ...")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.device is not None:
+            _sync_if_cuda(self.device)
+        elapsed = time.perf_counter() - self.start
+        status = "failed" if exc_type else "done"
+        _log(f"{self.label} {status} in {elapsed:.1f}s")
+
+
+def _normalize_on(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    return F.normalize(values.float().to(device, non_blocking=True), dim=-1)
+
+
+def _cosine_topk_fast(
+    queries: torch.Tensor,
+    bank: torch.Tensor,
+    k: int,
+    query_chunk_size: int,
+    bank_chunk_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cosine top-k that keeps the heavy matrix multiplications on ``device``."""
+
+    queries = _normalize_on(queries, device)
+    bank = _normalize_on(bank, device)
+    k = min(int(k), bank.shape[0])
+    all_values, all_indices = [], []
+    for start in range(0, queries.shape[0], int(query_chunk_size)):
+        query = queries[start : start + int(query_chunk_size)]
+        values = torch.full((query.shape[0], k), -float("inf"), device=device)
+        indices = torch.full((query.shape[0], k), -1, dtype=torch.long, device=device)
+        for bank_start in range(0, bank.shape[0], int(bank_chunk_size)):
+            block = bank[bank_start : bank_start + int(bank_chunk_size)]
+            similarity = query @ block.T
+            local_k = min(k, similarity.shape[1])
+            local_values, local_indices = torch.topk(similarity, local_k, dim=1)
+            merged_values = torch.cat([values, local_values], dim=1)
+            merged_indices = torch.cat([indices, local_indices + int(bank_start)], dim=1)
+            values, order = torch.topk(merged_values, k, dim=1)
+            indices = torch.gather(merged_indices, 1, order)
+        all_values.append(values)
+        all_indices.append(indices)
+    return torch.cat(all_values), torch.cat(all_indices)
+
+
+def _assign_prototypes_fast(
+    values: torch.Tensor,
+    centers: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    normalized = _normalize_on(values.reshape(-1, values.shape[-1]), device)
+    centers = _normalize_on(centers, device)
+    return (normalized @ centers.T).argmax(dim=1)
+
+
+def _prototype_by_mstar_fast(
+    memory_prototype_ids: torch.Tensor,
+    nn_indices: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    return memory_prototype_ids.long().to(device)[nn_indices.long()]
+
+
+def _prototype_by_topk_vote_k5_fast(
+    memory_prototype_ids: torch.Tensor,
+    topk_indices: torch.Tensor,
+    prototype_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if topk_indices.shape[-1] != 5:
+        raise ValueError("topk vote protocol is fixed to k=5")
+    votes = memory_prototype_ids.long().to(device)[topk_indices.long()]
+    flat = votes.reshape(-1, 5)
+    counts = F.one_hot(flat, num_classes=int(prototype_count)).sum(dim=1)
+    return counts.argmax(dim=1).reshape(votes.shape[:-1])
 
 
 def explained_energy(
@@ -180,22 +280,24 @@ def fit_uncentered_basis_covariance(
     values: torch.Tensor,
     rank: int,
     chunk_size: int = 32768,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """Fit the same uncentered objective through a chunked X^T X eigensolve."""
 
-    values = values.reshape(-1, values.shape[-1]).float().cpu()
+    values = values.reshape(-1, values.shape[-1]).float()
     if values.shape[0] < 1:
         raise ValueError("At least one row is required")
+    work_device = device or values.device
     covariance = torch.zeros(
-        values.shape[1], values.shape[1], dtype=torch.float32
+        values.shape[1], values.shape[1], dtype=torch.float32, device=work_device
     )
     for start in range(0, values.shape[0], int(chunk_size)):
-        block = values[start : start + int(chunk_size)].float()
+        block = values[start : start + int(chunk_size)].to(work_device, non_blocking=True)
         covariance += block.T @ block
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     order = torch.argsort(eigenvalues, descending=True)
     effective_rank = min(max(1, int(rank)), values.shape[1])
-    return eigenvectors[:, order[:effective_rank]].T.float().contiguous()
+    return eigenvectors[:, order[:effective_rank]].T.float().cpu().contiguous()
 
 def safe_correlation(left: Sequence[float], right: Sequence[float]) -> float:
     x = np.asarray(left, dtype=np.float64)
@@ -254,6 +356,7 @@ def basis_stability_rows(
     repeats: int = 5,
     fraction: float = 0.80,
     seed: int = 42,
+    device: torch.device | None = None,
 ) -> list[dict[str, Any]]:
     """Refit bases on image-level subsamples with fixed prototype assignment."""
 
@@ -269,6 +372,7 @@ def basis_stability_rows(
         global_basis = fit_uncentered_basis_covariance(
             deltas[patch_mask].reshape(-1, deltas.shape[-1]),
             rank,
+            device=device,
         )
         rows.append(
             {
@@ -296,6 +400,7 @@ def basis_stability_rows(
                 candidate = fit_uncentered_basis_covariance(
                     deltas[members].reshape(-1, deltas.shape[-1]),
                     rank,
+                    device=device,
                 )
                 distance = projector_distance(
                     model.delta_bases[prototype], candidate
@@ -507,31 +612,34 @@ def _cached_or_extract(
 def _retrieval_context(
     features: torch.Tensor,
     pipeline,
+    device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    from .pipeline import _cosine_topk
-
     pipeline._require_fitted()
-    query = F.normalize(features.float().cpu(), dim=-1)
+    assert pipeline.memory_result is not None
+    assert pipeline.prototype_model is not None
+    assert pipeline.memory_prototype_ids is not None
+    query = _normalize_on(features, device)
     shape = query.shape
     flat = query.reshape(-1, shape[-1])
-    similarities, indices = _cosine_topk(
+    similarities, indices = _cosine_topk_fast(
         flat,
         pipeline.memory_result.memory_bank,
         5,
         pipeline.query_chunk_size,
         pipeline.bank_chunk_size,
+        device,
     )
-    nearest = pipeline.memory_result.memory_bank[indices[:, 0]]
+    nearest = pipeline.memory_result.memory_bank.to(device, non_blocking=True)[indices[:, 0]]
     deviation = flat - nearest
-    mstar_ids = prototype_by_mstar(
-        pipeline.memory_prototype_ids, indices[:, 0]
+    prototype_count = int(pipeline.prototype_model.centers.shape[0])
+    mstar_ids = _prototype_by_mstar_fast(
+        pipeline.memory_prototype_ids, indices[:, 0], device
     )
-    vote_ids = prototype_by_topk_vote_k5(
-        pipeline.memory_prototype_ids, indices
+    vote_ids = _prototype_by_topk_vote_k5_fast(
+        pipeline.memory_prototype_ids, indices, prototype_count, device
     )
     direct_similarity = (
-        flat
-        @ F.normalize(pipeline.prototype_model.centers.float().cpu(), dim=-1).T
+        flat @ _normalize_on(pipeline.prototype_model.centers, device).T
     )
     top2 = torch.topk(direct_similarity, k=min(2, direct_similarity.shape[1]), dim=1)
     direct_ids = top2.indices[:, 0]
@@ -548,6 +656,81 @@ def _retrieval_context(
         "direct_ids": direct_ids.reshape(shape[:-1]),
         "margin": margin.reshape(shape[:-1]),
         "cosine_distance": (1.0 - similarities[:, 0]).reshape(shape[:-1]),
+    }
+
+
+def _score_patch_features_fast(
+    features: torch.Tensor,
+    pipeline,
+    device: torch.device,
+    context: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Diagnostic-only scorer that mirrors ConditionalNVSPipeline on GPU."""
+
+    pipeline._require_fitted()
+    assert pipeline.prototype_model is not None
+    ctx = context if context is not None else _retrieval_context(features, pipeline, device)
+    deviation = ctx["deviation"]
+    flat = deviation.reshape(-1, deviation.shape[-1])
+    prototype_ids = (
+        ctx["mstar_ids"]
+        if pipeline.prototype_selection == "proto_by_mstar"
+        else ctx["vote_ids"]
+    ).reshape(-1)
+    model = pipeline.prototype_model
+    d0 = ctx["cosine_distance"]
+    d1_global = partial_residual_norm(
+        flat, model.global_feature_basis.to(device, non_blocking=True), 1.0
+    ).reshape(deviation.shape[:-1])
+    d2_global = partial_residual_norm(
+        flat, model.global_delta_basis.to(device, non_blocking=True), 1.0
+    ).reshape(deviation.shape[:-1])
+    d1_proto = conditional_partial_residual_norm(
+        flat,
+        model.feature_bases.to(device, non_blocking=True),
+        prototype_ids,
+        1.0,
+    ).reshape(deviation.shape[:-1])
+    d3_proto = conditional_partial_residual_norm(
+        flat,
+        model.delta_bases.to(device, non_blocking=True),
+        prototype_ids,
+        1.0,
+    ).reshape(deviation.shape[:-1])
+    return {
+        "D0_NN": d0,
+        "D1_Global": d1_global,
+        "D1_Proto": d1_proto,
+        "D2_NVSGlobal": d2_global,
+        "D3_NVSProto": d3_proto,
+    }
+
+
+def _fit_calibrations_fast(
+    raw_scores: Mapping[str, torch.Tensor],
+    image_quantile: float,
+    mad_epsilon: float,
+) -> dict[str, Any]:
+    return {
+        method: fit_calibration(
+            values.detach().cpu().numpy(),
+            image_quantile=image_quantile,
+            mad_epsilon=mad_epsilon,
+            scope="identity_calibration",
+        )
+        for method, values in raw_scores.items()
+    }
+
+
+def _normalize_scores_fast(
+    raw_scores: Mapping[str, torch.Tensor],
+    calibrations: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    return {
+        method: torch.from_numpy(
+            calibrations[method].normalize(values.detach().cpu().numpy())
+        ).float()
+        for method, values in raw_scores.items()
     }
 
 
@@ -585,31 +768,28 @@ def _normal_delta_diagnostics(
     transformed: Sequence[torch.Tensor],
     model: PrototypeModel,
     seed: int,
+    device: torch.device,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, float]]:
-    originals = F.normalize(original.float().cpu(), dim=-1)
+    originals = _normalize_on(original, device)
     flat_original = originals.reshape(-1, originals.shape[-1])
-    own_ids = assign_prototypes(flat_original, model.centers)
+    own_ids = _assign_prototypes_fast(flat_original, model.centers, device)
     wrong_ids = wrong_prototype_ids(
-        own_ids, model.centers.shape[0], seed
-    )
-    image_ids = torch.arange(originals.shape[0]).repeat_interleave(
+        own_ids.detach().cpu(), model.centers.shape[0], seed
+    ).to(device)
+    image_ids = torch.arange(originals.shape[0], device=device).repeat_interleave(
         originals.shape[1]
     )
+    global_basis = model.global_delta_basis.to(device, non_blocking=True)
+    delta_bases = model.delta_bases.to(device, non_blocking=True)
     energy_rows: list[dict[str, Any]] = []
     all_deltas, all_own, all_wrong, all_global = [], [], [], []
     transform_count = len(transformed)
-    for transform_index, (spec, values) in enumerate(
-        zip(FIT_TRANSFORMS, transformed)
-    ):
-        normalized = F.normalize(values.float().cpu(), dim=-1)
+    for spec, values in zip(FIT_TRANSFORMS, transformed):
+        normalized = _normalize_on(values, device)
         delta = normalized.reshape_as(flat_original) - flat_original
-        global_energy = explained_energy(delta, model.global_delta_basis)
-        own_energy = conditional_explained_energy(
-            delta, model.delta_bases, own_ids
-        )
-        wrong_energy = conditional_explained_energy(
-            delta, model.delta_bases, wrong_ids
-        )
+        global_energy = explained_energy(delta, global_basis)
+        own_energy = conditional_explained_energy(delta, delta_bases, own_ids)
+        wrong_energy = conditional_explained_energy(delta, delta_bases, wrong_ids)
         energy_rows.append(
             _aggregate_energy_row(
                 category,
@@ -620,7 +800,7 @@ def _normal_delta_diagnostics(
                 wrong_energy,
             )
         )
-        for prototype in torch.unique(own_ids).tolist():
+        for prototype in torch.unique(own_ids).detach().cpu().tolist():
             selected = own_ids == int(prototype)
             energy_rows.append(
                 _aggregate_energy_row(
@@ -643,8 +823,10 @@ def _normal_delta_diagnostics(
     unit_delta = F.normalize(flat_delta, dim=-1)
     global_centroid = unit_delta.mean(dim=0)
     global_dispersion = float(
-        (unit_delta - global_centroid).square().sum(dim=-1).mean()
+        (unit_delta - global_centroid).square().sum(dim=-1).mean().detach().cpu()
     )
+    global_energy_stack = torch.stack(all_global, dim=1)
+    own_energy_flat = torch.stack(all_own, dim=1).reshape(-1)
     compactness_rows: list[dict[str, Any]] = [
         {
             "category": category,
@@ -656,23 +838,23 @@ def _normal_delta_diagnostics(
             "global_dispersion": global_dispersion,
             "within_dispersion": global_dispersion,
             "within_global_ratio": 1.0,
-            "cv_explained_energy": float(torch.stack(all_global, dim=1).mean()),
-            "cv_residual_energy": float(1.0 - torch.stack(all_global, dim=1).mean()),
+            "cv_explained_energy": float(global_energy_stack.mean().detach().cpu()),
+            "cv_residual_energy": float((1.0 - global_energy_stack.mean()).detach().cpu()),
         }
     ]
     for prototype in range(model.centers.shape[0]):
         selected = repeated_own == prototype
-        if not bool(selected.any()):
+        if not bool(selected.any().detach().cpu()):
             continue
         group = unit_delta[selected]
         centroid = group.mean(dim=0)
-        dispersion = float((group - centroid).square().sum(dim=-1).mean())
+        dispersion = float((group - centroid).square().sum(dim=-1).mean().detach().cpu())
         original_members = own_ids == prototype
         compactness_rows.append(
             {
                 "category": category,
                 "prototype": prototype,
-                "heldout_patch_count": int(original_members.sum()),
+                "heldout_patch_count": int(original_members.sum().detach().cpu()),
                 "heldout_unique_image_count": int(
                     torch.unique(repeated_images[selected]).numel()
                 ),
@@ -681,12 +863,8 @@ def _normal_delta_diagnostics(
                 "global_dispersion": global_dispersion,
                 "within_dispersion": dispersion,
                 "within_global_ratio": dispersion / max(global_dispersion, EPS),
-                "cv_explained_energy": float(
-                    torch.stack(all_own, dim=1).reshape(-1)[selected].mean()
-                ),
-                "cv_residual_energy": float(
-                    1.0 - torch.stack(all_own, dim=1).reshape(-1)[selected].mean()
-                ),
+                "cv_explained_energy": float(own_energy_flat[selected].mean().detach().cpu()),
+                "cv_residual_energy": float((1.0 - own_energy_flat[selected].mean()).detach().cpu()),
             }
         )
     proto_rows = [row for row in compactness_rows if row["prototype"] != -1]
@@ -711,11 +889,13 @@ def _erasure_rows(
     model: PrototypeModel,
 ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
     flat = deviation.reshape(-1, deviation.shape[-1])
-    ids = mstar_ids.reshape(-1)
-    defect = defect_mask.reshape(-1).bool()
-    global_energy = explained_energy(flat, model.global_delta_basis)
+    ids = mstar_ids.reshape(-1).long().to(flat.device)
+    defect = defect_mask.reshape(-1).bool().to(flat.device)
+    global_energy = explained_energy(
+        flat, model.global_delta_basis.to(flat.device, non_blocking=True)
+    )
     proto_energy = conditional_explained_energy(
-        flat, model.delta_bases, ids
+        flat, model.delta_bases.to(flat.device, non_blocking=True), ids
     ).reshape(-1)
     rows = []
     for patch_type, selected in (
@@ -765,37 +945,41 @@ def _alpha_rows(
     for basis_kind in ("global", "prototype"):
         for alpha in alphas:
             if basis_kind == "global":
+                device = calibration_context["deviation"].device
+                global_basis = pipeline.prototype_model.global_delta_basis.to(device, non_blocking=True)
                 calibration_scores = partial_residual_norm(
                     calibration_context["deviation"],
-                    pipeline.prototype_model.global_delta_basis,
+                    global_basis,
                     alpha,
                 )
                 test_scores = partial_residual_norm(
                     test_context["deviation"],
-                    pipeline.prototype_model.global_delta_basis,
+                    global_basis,
                     alpha,
                 )
             else:
+                device = calibration_context["deviation"].device
+                delta_bases = pipeline.prototype_model.delta_bases.to(device, non_blocking=True)
                 calibration_scores = conditional_partial_residual_norm(
                     calibration_context["deviation"],
-                    pipeline.prototype_model.delta_bases,
+                    delta_bases,
                     calibration_context["mstar_ids"],
                     alpha,
                 )
                 test_scores = conditional_partial_residual_norm(
                     test_context["deviation"],
-                    pipeline.prototype_model.delta_bases,
+                    delta_bases,
                     test_context["mstar_ids"],
                     alpha,
                 )
             state = fit_calibration(
-                calibration_scores.numpy(),
+                calibration_scores.detach().cpu().numpy(),
                 image_quantile=float(calibration_config.get("image_quantile", 0.95)),
                 mad_epsilon=float(calibration_config.get("mad_epsilon", 1.0e-6)),
                 scope="identity_calibration",
             )
             normalized = torch.from_numpy(
-                state.normalize(test_scores.numpy())
+                state.normalize(test_scores.detach().cpu().numpy())
             ).float()
             maps = patch_scores_to_maps(
                 normalized,
@@ -1382,6 +1566,10 @@ def _run(args: argparse.Namespace) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     device = torch.device(args.device)
+    _log(
+        f"start seed={seed} categories={categories} device={device} "
+        f"memory_protocol={config['memory']['protocol']}"
+    )
     model = load_dinov2(
         config["model"]["name"], device, config["model"].get("hub_dir")
     )
@@ -1397,9 +1585,11 @@ def _run(args: argparse.Namespace) -> None:
         "per_category_summary": [],
     }
     for category in categories:
+        _log(f"{category}: start")
         category_dir = output_dir / category
         category_dir.mkdir(parents=True, exist_ok=True)
-        train_records, test_records = build_mvtec_dataset(args.data_root, category)
+        with _StageTimer(f"{category}: parse dataset"):
+            train_records, test_records = build_mvtec_dataset(args.data_root, category)
         split = split_three_way(
             train_records,
             split_seed=seed,
@@ -1411,24 +1601,25 @@ def _run(args: argparse.Namespace) -> None:
         manifest = split.manifest(key=lambda record: str(record.path))
         _write_json(category_dir / "sample_manifest.json", manifest)
 
-        memory_features, grid_side = _cached_or_extract(
-            category, "memory_identity", split.memory, config, model, device
-        )
-        nvs_original, _ = _cached_or_extract(
-            category, "nvs_fit_identity", split.nvs_fit, config, model, device
-        )
-        nvs_transformed = tuple(
-            _cached_or_extract(
-                category,
-                f"nvs_fit_{transform_name(dict(spec))}",
-                split.nvs_fit,
-                config,
-                model,
-                device,
-                dict(spec),
-            )[0]
-            for spec in FIT_TRANSFORMS
-        )
+        with _StageTimer(f"{category}: extract/load memory and nvs_fit features", device):
+            memory_features, grid_side = _cached_or_extract(
+                category, "memory_identity", split.memory, config, model, device
+            )
+            nvs_original, _ = _cached_or_extract(
+                category, "nvs_fit_identity", split.nvs_fit, config, model, device
+            )
+            nvs_transformed = tuple(
+                _cached_or_extract(
+                    category,
+                    f"nvs_fit_{transform_name(dict(spec))}",
+                    split.nvs_fit,
+                    config,
+                    model,
+                    device,
+                    dict(spec),
+                )[0]
+                for spec in FIT_TRANSFORMS
+            )
         pipeline_memory = memory_features
         reused_core_memory = False
         core_root_value = diagnostics.get("reuse_core_output")
@@ -1465,16 +1656,17 @@ def _run(args: argparse.Namespace) -> None:
             # only the expensive k-center reconstruction is skipped.
             pipeline.memory_strategy = "full"
             pipeline.memory_capacity = 0
-        pipeline.fit(
-            __import__(
-                "nvs.conditional_nvs.pipeline",
-                fromlist=["FeatureSplit"],
-            ).FeatureSplit(
-                memory=pipeline_memory,
-                nvs_fit_original=nvs_original,
-                nvs_fit_transformed=nvs_transformed,
+        with _StageTimer(f"{category}: fit frozen D2/D3 state"):
+            pipeline.fit(
+                __import__(
+                    "nvs.conditional_nvs.pipeline",
+                    fromlist=["FeatureSplit"],
+                ).FeatureSplit(
+                    memory=pipeline_memory,
+                    nvs_fit_original=nvs_original,
+                    nvs_fit_transformed=nvs_transformed,
+                )
             )
-        )
         normalized_nvs = F.normalize(nvs_original.float().cpu(), dim=-1)
         flat_nvs = normalized_nvs.reshape(-1, normalized_nvs.shape[-1])
         nvs_deltas = torch.stack(
@@ -1488,52 +1680,50 @@ def _run(args: argparse.Namespace) -> None:
         nvs_image_ids = torch.arange(nvs_original.shape[0]).repeat_interleave(
             nvs_original.shape[1]
         )
-        stability_rows = basis_stability_rows(
-            nvs_deltas,
-            nvs_image_ids,
-            pipeline.prototype_model.labels,
-            pipeline.prototype_model,
-            repeats=int(diagnostics.get("bootstrap_repeats", 5)),
-            fraction=float(diagnostics.get("bootstrap_fraction", 0.80)),
-            seed=seed,
-        )
+        with _StageTimer(f"{category}: basis stability bootstrap", device):
+            stability_rows = basis_stability_rows(
+                nvs_deltas,
+                nvs_image_ids,
+                pipeline.prototype_model.labels,
+                pipeline.prototype_model,
+                repeats=int(diagnostics.get("bootstrap_repeats", 5)),
+                fraction=float(diagnostics.get("bootstrap_fraction", 0.80)),
+                seed=seed,
+                device=device,
+            )
         for row in stability_rows:
             row["category"] = category
         del nvs_transformed, nvs_original, memory_features, pipeline_memory, nvs_deltas, normalized_nvs, flat_nvs, nvs_image_ids
 
-        calibration_original, _ = _cached_or_extract(
-            category,
-            "calibration_identity",
-            split.calibration,
-            config,
-            model,
-            device,
-        )
-        calibration_transformed = tuple(
-            _cached_or_extract(
+        with _StageTimer(f"{category}: extract/load calibration and test features", device):
+            calibration_original, _ = _cached_or_extract(
                 category,
-                f"calibration_{transform_name(dict(spec))}",
+                "calibration_identity",
                 split.calibration,
                 config,
                 model,
                 device,
-                dict(spec),
-            )[0]
-            for spec in FIT_TRANSFORMS
-        )
-        pipeline.calibrate(
-            calibration_original,
-            image_quantile=float(config["calibration"]["image_quantile"]),
-            mad_epsilon=float(config["calibration"]["mad_epsilon"]),
-        )
-        test_features, test_grid = _cached_or_extract(
-            category,
-            "test_identity",
-            test_records,
-            config,
-            model,
-            device,
-        )
+            )
+            calibration_transformed = tuple(
+                _cached_or_extract(
+                    category,
+                    f"calibration_{transform_name(dict(spec))}",
+                    split.calibration,
+                    config,
+                    model,
+                    device,
+                    dict(spec),
+                )[0]
+                for spec in FIT_TRANSFORMS
+            )
+            test_features, test_grid = _cached_or_extract(
+                category,
+                "test_identity",
+                test_records,
+                config,
+                model,
+                device,
+            )
         if test_grid != grid_side:
             raise AssertionError("Train/test feature grids differ")
         masks, labels = _masks_and_labels(
@@ -1542,29 +1732,41 @@ def _run(args: argparse.Namespace) -> None:
         defect_patch_mask = adaptive_patch_mask(masks, grid_side)
 
         category_seed = seed + sum(category.encode("utf-8"))
-        energy_rows, compactness_rows, compactness_correlations = (
-            _normal_delta_diagnostics(
-                category,
-                calibration_original,
-                calibration_transformed,
-                pipeline.prototype_model,
-                category_seed,
+        with _StageTimer(f"{category}: held-out normal delta diagnostics", device):
+            energy_rows, compactness_rows, compactness_correlations = (
+                _normal_delta_diagnostics(
+                    category,
+                    calibration_original,
+                    calibration_transformed,
+                    pipeline.prototype_model,
+                    category_seed,
+                    device,
+                )
             )
-        )
-        calibration_context = _retrieval_context(
-            calibration_original, pipeline
-        )
-        test_context = _retrieval_context(test_features, pipeline)
-        erasure_rows, _, _ = _erasure_rows(
-            category,
-            test_context["deviation"],
-            test_context["mstar_ids"],
-            defect_patch_mask,
-            pipeline.prototype_model,
-        )
+        with _StageTimer(f"{category}: GPU nearest-neighbor retrieval contexts", device):
+            calibration_context = _retrieval_context(calibration_original, pipeline, device)
+            test_context = _retrieval_context(test_features, pipeline, device)
+        with _StageTimer(f"{category}: anomaly erasure diagnostics", device):
+            erasure_rows, _, _ = _erasure_rows(
+                category,
+                test_context["deviation"],
+                test_context["mstar_ids"],
+                defect_patch_mask,
+                pipeline.prototype_model,
+            )
 
-        calibration_raw = pipeline.score_patch_features(calibration_original)
-        calibration_normalized = pipeline.normalize_scores(calibration_raw)
+        with _StageTimer(f"{category}: GPU calibration scoring", device):
+            calibration_raw = _score_patch_features_fast(
+                calibration_original, pipeline, device, calibration_context
+            )
+            pipeline.calibrations = _fit_calibrations_fast(
+                calibration_raw,
+                image_quantile=float(config["calibration"]["image_quantile"]),
+                mad_epsilon=float(config["calibration"]["mad_epsilon"]),
+            )
+            calibration_normalized = _normalize_scores_fast(
+                calibration_raw, pipeline.calibrations
+            )
         d3_state = pipeline.calibrations["D3_NVSProto"]
         calibration_rows = prototype_calibration_rows(
             calibration_raw["D3_NVSProto"],
@@ -1576,11 +1778,12 @@ def _run(args: argparse.Namespace) -> None:
         for row in calibration_rows:
             row["category"] = category
 
-        test_raw = pipeline.score_patch_features(test_features)
-        test_normalized = pipeline.normalize_scores(test_raw)
-        test_positive = (
-            test_normalized["D3_NVSProto"] >= d3_state.threshold
-        )
+        with _StageTimer(f"{category}: GPU test scoring", device):
+            test_raw = _score_patch_features_fast(
+                test_features, pipeline, device, test_context
+            )
+            test_normalized = _normalize_scores_fast(test_raw, pipeline.calibrations)
+        test_positive = test_normalized["D3_NVSProto"] >= d3_state.threshold
         patch_types = defect_patch_mask.long()
         route_rows = routing_rows(
             test_context["mstar_ids"],
@@ -1593,19 +1796,17 @@ def _run(args: argparse.Namespace) -> None:
         for row in route_rows:
             row["category"] = category
             row["scope"] = "test"
-        original_direct = assign_prototypes(
-            F.normalize(
-                calibration_original.float().cpu(), dim=-1
-            ).reshape(-1, calibration_original.shape[-1]),
+        original_direct = _assign_prototypes_fast(
+            calibration_original.reshape(-1, calibration_original.shape[-1]),
             pipeline.prototype_model.centers,
-        )
+            device,
+        ).detach().cpu()
         for spec, transformed in zip(FIT_TRANSFORMS, calibration_transformed):
-            transformed_direct = assign_prototypes(
-                F.normalize(transformed.float().cpu(), dim=-1).reshape(
-                    -1, transformed.shape[-1]
-                ),
+            transformed_direct = _assign_prototypes_fast(
+                transformed.reshape(-1, transformed.shape[-1]),
                 pipeline.prototype_model.centers,
-            )
+                device,
+            ).detach().cpu()
             route_rows.append(
                 {
                     "category": category,
@@ -1624,28 +1825,29 @@ def _run(args: argparse.Namespace) -> None:
 
 
 
-        alpha_rows = _alpha_rows(
-            category,
-            calibration_context,
-            test_context,
-            pipeline,
-            masks,
-            labels,
-            grid_side,
-            int(config["data"]["input_size"]),
-            [float(value) for value in diagnostics["alphas"]],
-            config["calibration"],
-            float(config["metrics"]["small_defect_area_fraction"]),
-        )
+        with _StageTimer(f"{category}: alpha sweep diagnostics", device):
+            alpha_rows = _alpha_rows(
+                category,
+                calibration_context,
+                test_context,
+                pipeline,
+                masks,
+                labels,
+                grid_side,
+                int(config["data"]["input_size"]),
+                [float(value) for value in diagnostics["alphas"]],
+                config["calibration"],
+                float(config["metrics"]["small_defect_area_fraction"]),
+            )
         # Required numerical regression: alpha=1 equals the existing residual.
         alpha_one_global = partial_residual_norm(
             test_context["deviation"],
-            pipeline.prototype_model.global_delta_basis,
+            pipeline.prototype_model.global_delta_basis.to(device, non_blocking=True),
             1.0,
         )
         alpha_one_proto = conditional_partial_residual_norm(
             test_context["deviation"],
-            pipeline.prototype_model.delta_bases,
+            pipeline.prototype_model.delta_bases.to(device, non_blocking=True),
             test_context["mstar_ids"],
             1.0,
         )
@@ -1728,9 +1930,10 @@ def _run(args: argparse.Namespace) -> None:
             "basis_stability": stability_rows,
             "per_category_summary": [category_summary],
         }
-        for name, rows in category_payloads.items():
-            _write_csv(category_dir / f"{name}.csv", rows)
-            all_outputs[name].extend(rows)
+        with _StageTimer(f"{category}: write category outputs"):
+            for name, rows in category_payloads.items():
+                _write_csv(category_dir / f"{name}.csv", rows)
+                all_outputs[name].extend(rows)
         _write_json(
             category_dir / "category_complete.json",
             {
@@ -1743,8 +1946,9 @@ def _run(args: argparse.Namespace) -> None:
             },
         )
 
-    for name, rows in all_outputs.items():
-        _write_csv(output_dir / f"{name}.csv", rows)
+    with _StageTimer("write aggregate outputs"):
+        for name, rows in all_outputs.items():
+            _write_csv(output_dir / f"{name}.csv", rows)
     conclusion = _diagnostic_conclusion(
         all_outputs["per_category_summary"], diagnostics
     )

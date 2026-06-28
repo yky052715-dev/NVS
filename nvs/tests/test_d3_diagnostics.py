@@ -7,12 +7,15 @@ import pytest
 import torch
 
 from nvs.conditional_nvs.conditional_subspace import PrototypeModel
+from nvs.conditional_nvs.pipeline import ConditionalNVSPipeline, FeatureSplit
 from nvs.conditional_nvs.d3_diagnostics import (
     adaptive_patch_mask,
     basis_stability_rows,
     explained_energy,
     partial_residual_norm,
     routing_agreement,
+    _retrieval_context,
+    _score_patch_features_fast,
     sample_image_ids,
     wrong_prototype_ids,
 )
@@ -94,3 +97,32 @@ def test_fixed_seed_subsample_is_reproducible() -> None:
     first = sample_image_ids(image_ids, fraction=0.8, seed=42)
     second = sample_image_ids(image_ids, fraction=0.8, seed=42)
     assert torch.equal(first, second)
+
+
+
+def test_fast_diagnostic_scorer_matches_pipeline_cpu() -> None:
+    torch.manual_seed(0)
+    memory = torch.randn(3, 4, 8)
+    original = torch.randn(2, 4, 8)
+    transformed = tuple(original + 0.01 * torch.randn_like(original) for _ in range(13))
+    query = torch.randn(2, 4, 8)
+    pipeline = ConditionalNVSPipeline(
+        rank=2,
+        prototypes=3,
+        memory_strategy="full",
+        memory_capacity=0,
+        seed=0,
+        query_chunk_size=5,
+        bank_chunk_size=6,
+    ).fit(
+        FeatureSplit(
+            memory=memory,
+            nvs_fit_original=original,
+            nvs_fit_transformed=transformed,
+        )
+    )
+    slow = pipeline.score_patch_features(query)
+    context = _retrieval_context(query, pipeline, torch.device("cpu"))
+    fast = _score_patch_features_fast(query, pipeline, torch.device("cpu"), context)
+    for method, values in slow.items():
+        assert torch.allclose(values, fast[method].cpu(), atol=1.0e-6, rtol=1.0e-6)
