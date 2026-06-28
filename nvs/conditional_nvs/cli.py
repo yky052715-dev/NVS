@@ -168,6 +168,7 @@ def _pipeline(
     strategy, capacity = MEMORY_PROTOCOLS[protocol]
     subspace = config["subspace"]
     whitening = config.get("whitening", {}) or {}
+    sr_config = config.get("stability_regularization", {}) or {}
     compute_device = torch.device(device or "cpu")
     query_chunk_size = int(memory.get("query_chunk_size", 4096))
     bank_chunk_size = int(memory.get("bank_chunk_size", 8192))
@@ -195,7 +196,21 @@ def _pipeline(
         whitener_shrinkage=float(whitening.get("lambda", 0.07)),
         whitener_relative_floor=float(whitening.get("relative_floor", 1.0e-8)),
         whitener_max_components=whitening.get("max_components"),
+        stability_regularization=bool(sr_config.get("enabled", False)),
+        sr_bootstrap_repeats=int(sr_config.get("bootstrap_repeats", 5)),
+        sr_bootstrap_fraction=float(sr_config.get("bootstrap_fraction", 0.8)),
+        sr_weight_epsilon=float(sr_config.get("weight_epsilon", 1.0e-8)),
     )
+
+
+def _configured_methods(config: dict[str, Any]) -> tuple[str, ...]:
+    report_methods = config.get("report_methods")
+    if report_methods:
+        return tuple(str(method) for method in report_methods)
+    methods = list(CORE_METHODS)
+    if bool((config.get("stability_regularization", {}) or {}).get("enabled", False)):
+        methods.append("SR_CNVS")
+    return tuple(methods)
 
 
 def _validate_core_config(config: dict[str, Any]) -> None:
@@ -294,6 +309,9 @@ def _fit_category(
                 fit_scope="identity_calibration",
             )
     _save_json(category_dir / "state_summary.json", pipeline.state_summary())
+    sr_rows = pipeline.sr_weight_rows()
+    if sr_rows:
+        _write_csv(category_dir / "sr_cnvs_prototype_weights.csv", sr_rows)
     _save_json(
         category_dir / "calibration.json",
         {
@@ -334,6 +352,10 @@ def _evaluate_records(
         masks, labels = _masks_and_labels(records, int(config["data"]["input_size"]))
     rows: list[dict[str, Any]] = []
     scores = dict(normalized)
+    report_methods = config.get("report_methods")
+    if report_methods:
+        keep = {str(method) for method in report_methods}
+        scores = {method: value for method, value in scores.items() if method in keep}
     fusion = config.get("fusion", {}) or {}
     if bool(fusion.get("enabled", False)):
         for alpha in fusion.get("alphas", [0.25]):
@@ -398,12 +420,14 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
             "D1_Proto": "prototype centered-feature PCA residual on d=q-m*",
             "D2_NVSGlobal": "global uncentered-delta SVD residual on d=q-m*",
             "D3_NVSProto": "prototype uncentered-delta SVD residual on d=q-m*",
+            "SR_CNVS": "stability-regularized shrinkage between global and prototype NVS projectors",
         },
     )
     device = torch.device(args.device)
     model = load_dinov2(
         config["model"]["name"], device, config["model"].get("hub_dir")
     )
+    methods = _configured_methods(config)
     all_rows: list[dict[str, Any]] = []
     robustness_rows: list[dict[str, Any]] = []
     for category in categories:
@@ -415,9 +439,7 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
             seed,
             key=lambda record: str(record.path),
         ).manifest(key=lambda record: str(record.path))
-        metadata = protocol_metadata(
-            category, seed, prospective, config, CORE_METHODS
-        )
+        metadata = protocol_metadata(category, seed, prospective, config, methods)
         marker = category_dir / "experiment_complete.json"
         if not args.force and completion_is_valid(marker, metadata):
             continue
@@ -472,7 +494,7 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 category_dir / "unseen_robustness.csv",
                 [row for row in robustness_rows if row["category"] == category],
             )
-        metadata = protocol_metadata(category, seed, manifest, config, CORE_METHODS)
+        metadata = protocol_metadata(category, seed, manifest, config, methods)
         write_completion(marker, metadata)
         _write_csv(output_dir / "category_metrics.csv", all_rows)
     if robustness_rows:

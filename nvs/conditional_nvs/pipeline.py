@@ -13,6 +13,7 @@ from .conditional_subspace import (
     prototype_by_mstar,
     prototype_by_topk_vote_k5,
     score_conditional_deviation,
+    score_sr_deviation,
     spherical_kmeans,
 )
 from .memory import MemoryBuildResult, build_memory
@@ -115,6 +116,10 @@ def _fit_model_in_appearance_space(
     prototypes: int,
     rank: int,
     seed: int,
+    stability_regularization: bool = False,
+    bootstrap_repeats: int = 5,
+    bootstrap_fraction: float = 0.8,
+    weight_epsilon: float = 1.0e-8,
 ) -> PrototypeModel:
     """Mahalanobis-full variant: rebuild clusters while keeping raw delta bases."""
 
@@ -144,17 +149,39 @@ def _fit_model_in_appearance_space(
             )
             feature_bases.append(feature_basis)
             delta_bases.append(delta_basis)
+    from .conditional_subspace import estimate_sr_weights
+
+    final_delta_bases = torch.stack(delta_bases)
+    sr_gain = sr_instability = sr_weights = None
+    if stability_regularization:
+        sr_gain, sr_instability, sr_weights = estimate_sr_weights(
+            deltas=deltas,
+            labels=labels,
+            image_ids=image_ids,
+            global_basis=global_delta,
+            local_bases=final_delta_bases,
+            fallback=fallback,
+            rank=rank,
+            seed=seed,
+            bootstrap_repeats=bootstrap_repeats,
+            bootstrap_fraction=bootstrap_fraction,
+            weight_epsilon=weight_epsilon,
+        )
+
     return PrototypeModel(
         centers=centers,
         labels=labels,
         feature_bases=torch.stack(feature_bases),
-        delta_bases=torch.stack(delta_bases),
+        delta_bases=final_delta_bases,
         fallback=fallback,
         unique_patch_counts=patch_counts,
         unique_image_counts=image_counts,
         global_feature_basis=global_feature,
         global_delta_basis=global_delta,
         rank=int(rank),
+        sr_gain=sr_gain,
+        sr_instability=sr_instability,
+        sr_weights=sr_weights,
     )
 
 
@@ -177,6 +204,10 @@ class ConditionalNVSPipeline:
         whitener_shrinkage: float = 0.07,
         whitener_relative_floor: float = 1.0e-8,
         whitener_max_components: int | None = None,
+        stability_regularization: bool = False,
+        sr_bootstrap_repeats: int = 5,
+        sr_bootstrap_fraction: float = 0.8,
+        sr_weight_epsilon: float = 1.0e-8,
     ) -> None:
         if prototype_selection not in {
             "proto_by_mstar",
@@ -201,6 +232,10 @@ class ConditionalNVSPipeline:
         self.whitener_shrinkage = float(whitener_shrinkage)
         self.whitener_relative_floor = float(whitener_relative_floor)
         self.whitener_max_components = whitener_max_components
+        self.stability_regularization = bool(stability_regularization)
+        self.sr_bootstrap_repeats = int(sr_bootstrap_repeats)
+        self.sr_bootstrap_fraction = float(sr_bootstrap_fraction)
+        self.sr_weight_epsilon = float(sr_weight_epsilon)
         self.memory_result: MemoryBuildResult | None = None
         self.prototype_model: PrototypeModel | None = None
         self.memory_prototype_ids: torch.Tensor | None = None
@@ -294,6 +329,10 @@ class ConditionalNVSPipeline:
                 self.prototypes,
                 self.rank,
                 self.seed,
+                stability_regularization=self.stability_regularization,
+                bootstrap_repeats=self.sr_bootstrap_repeats,
+                bootstrap_fraction=self.sr_bootstrap_fraction,
+                weight_epsilon=self.sr_weight_epsilon,
             )
         else:
             self.prototype_model = fit_prototype_model(
@@ -303,6 +342,10 @@ class ConditionalNVSPipeline:
                 prototypes=self.prototypes,
                 rank=self.rank,
                 seed=self.seed,
+                stability_regularization=self.stability_regularization,
+                bootstrap_repeats=self.sr_bootstrap_repeats,
+                bootstrap_fraction=self.sr_bootstrap_fraction,
+                weight_epsilon=self.sr_weight_epsilon,
             )
             appearance_features = original_flat
         memory_appearance = (
@@ -379,9 +422,12 @@ class ConditionalNVSPipeline:
                 deviation, self.prototype_model, prototype_ids
             ),
         }
+        if self.stability_regularization:
+            scores.update(score_sr_deviation(deviation, self.prototype_model, prototype_ids))
         return {
-            method: values.reshape(shape[:-1]).float()
-            for method, values in ((name, scores[name]) for name in CORE_METHODS)
+            method: scores[method].reshape(shape[:-1]).float()
+            for method in self.method_names()
+            if method in scores
         }
 
     def calibrate(
@@ -405,16 +451,57 @@ class ConditionalNVSPipeline:
     def normalize_scores(
         self, scores: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if set(CORE_METHODS) - set(self.calibrations):
-            raise RuntimeError("Independent calibration is required for every method")
+        missing = set(scores) - set(self.calibrations)
+        if missing:
+            raise RuntimeError(
+                f"Independent calibration is required for every method; missing {sorted(missing)}"
+            )
         return {
             method: torch.from_numpy(
-                self.calibrations[method].normalize(
-                    values.detach().cpu().numpy()
-                )
-            ).to(values.device, non_blocking=True).float()
-            for method, values in ((name, scores[name]) for name in CORE_METHODS)
+                self.calibrations[method].normalize(values.detach().cpu().numpy())
+            )
+            .to(values.device, non_blocking=True)
+            .float()
+            for method in self.method_names()
+            if method in scores
+            for values in (scores[method],)
         }
+
+    def method_names(self) -> tuple[str, ...]:
+        return CORE_METHODS + (("SR_CNVS",) if self.stability_regularization else ())
+
+    def sr_weight_rows(self) -> list[dict]:
+        self._require_fitted()
+        assert self.prototype_model is not None
+        model = self.prototype_model
+        if model.sr_weights is None:
+            return []
+        counts = torch.bincount(model.labels, minlength=model.centers.shape[0]).detach().cpu()
+        gains = model.sr_gain.detach().float().cpu() if model.sr_gain is not None else None
+        instabilities = (
+            model.sr_instability.detach().float().cpu()
+            if model.sr_instability is not None
+            else None
+        )
+        weights = model.sr_weights.detach().float().cpu()
+        fallback = model.fallback.detach().cpu()
+        unique_images = model.unique_image_counts.detach().cpu()
+        rows = []
+        for prototype in range(int(model.centers.shape[0])):
+            rows.append(
+                {
+                    "prototype": prototype,
+                    "member_count": int(counts[prototype]),
+                    "unique_image_count": int(unique_images[prototype]),
+                    "fallback": bool(fallback[prototype]),
+                    "g_c": None if gains is None else float(gains[prototype]),
+                    "v_c": None
+                    if instabilities is None
+                    else float(instabilities[prototype]),
+                    "w_c": float(weights[prototype]),
+                }
+            )
+        return rows
 
     def fuse(
         self,
@@ -437,6 +524,13 @@ class ConditionalNVSPipeline:
             "prototype_selection": self.prototype_selection,
             "search_mode": self.search_mode,
             "compute_device": str(self.compute_device),
+            "methods": list(self.method_names()),
+            "stability_regularization": {
+                "enabled": self.stability_regularization,
+                "bootstrap_repeats": self.sr_bootstrap_repeats,
+                "bootstrap_fraction": self.sr_bootstrap_fraction,
+                "weight_epsilon": self.sr_weight_epsilon,
+            },
             "memory_entries": self.memory_result.capacity,
             "memory_strategy": self.memory_result.strategy,
             "memory_algorithm": self.memory_result.algorithm,
