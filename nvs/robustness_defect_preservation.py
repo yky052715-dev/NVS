@@ -36,6 +36,7 @@ from nvs.metrics import (
     oracle_pixel_f1,
     safe_auroc,
 )
+from nvs.perturbation_cache import PerturbationCache
 from nvs.transforms import transform_name
 
 
@@ -67,6 +68,8 @@ def _score_records(
     config: dict[str, Any],
     model,
     device: torch.device,
+    *,
+    cached_images: bool = False,
 ) -> dict[str, Any]:
     from dinov2_mvtec_nn import extract_patch_tokens
 
@@ -77,7 +80,8 @@ def _score_records(
     defect_types: list[str] = []
     start = perf_counter()
     image_count = 0
-    for batch in tqdm(_loader(records, config, transform_spec=transform_spec, include_mask=True), desc=f"defect {state['category']} {transform_name(transform_spec)}"):
+    loader_transform = None if cached_images else transform_spec
+    for batch in tqdm(_loader(records, config, transform_spec=loader_transform, include_mask=True), desc=f"defect {state['category']} {transform_name(transform_spec)}"):
         features, grid_side = extract_patch_tokens(model, batch["image"], device)
         scores_by_method = _score_batch(features, state, config, device)
         for method, scores in scores_by_method.items():
@@ -259,6 +263,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--categories", nargs="+")
     parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS)
     parser.add_argument("--output-dir")
+    parser.add_argument(
+        "--perturbation-manifest",
+        help=(
+            "Optional manifest.csv produced by nvs.cache_perturbed_mvtec. "
+            "Masks remain sourced from the original MVTec tree."
+        ),
+    )
     parser.add_argument("--seed", type=int, help="Override experiment.seed from config")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -284,6 +295,11 @@ def main() -> None:
     output_dir = Path(config["experiment"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     save_json(config, output_dir / "resolved_config.json")
+    perturbation_cache = (
+        PerturbationCache(args.perturbation_manifest)
+        if args.perturbation_manifest
+        else None
+    )
 
     unavailable = sorted(set(args.methods) - set(_all_methods(config)))
     if unavailable:
@@ -314,7 +330,28 @@ def main() -> None:
             output_dir / category / "state_summary.json",
         )
         for spec in transforms:
-            scored = _score_records(anomaly_records, spec, state, config, model, device)
+            cached_images = (
+                perturbation_cache is not None
+                and str(spec.get("name", "identity")).lower() != "identity"
+            )
+            score_records = (
+                perturbation_cache.records_for(
+                    anomaly_records,
+                    category=category,
+                    transform_spec=spec,
+                )
+                if cached_images
+                else anomaly_records
+            )
+            scored = _score_records(
+                score_records,
+                spec,
+                state,
+                config,
+                model,
+                device,
+                cached_images=cached_images,
+            )
             outputs = _method_maps_and_predictions(scored["maps"], calibrations, config, args.methods)
             for method in args.methods:
                 payload = outputs[method]
@@ -345,6 +382,14 @@ def main() -> None:
             "transforms": [transform_name(spec) for spec in transforms],
             "methods": list(args.methods),
             "summary_rows": len(summary_rows),
+            "perturbation_manifest": (
+                str(perturbation_cache.manifest_path)
+                if perturbation_cache is not None
+                else None
+            ),
+            "perturbation_cache_rows": (
+                len(perturbation_cache) if perturbation_cache is not None else 0
+            ),
         },
         output_dir / "experiment_complete.json",
     )
