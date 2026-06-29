@@ -178,17 +178,18 @@ def _cached_transform_path(
     transform = transform_name(transform_spec)
     base = root / category / transform
     original = Path(record.path)
-    candidates: list[Path] = []
     if relative is not None:
-        candidates.append(base / relative)
-        candidates.append(base / relative.name)
-    candidates.extend(
-        [
-            base / "train" / "good" / original.name,
-            base / "good" / original.name,
-            base / original.name,
-        ]
-    )
+        exact = base / relative
+        return (
+            exact if exact.is_file() else None,
+            category,
+            transform,
+        )
+    candidates = [
+        base / "train" / "good" / original.name,
+        base / "good" / original.name,
+        base / original.name,
+    ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate, category, transform

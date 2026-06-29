@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -60,4 +60,27 @@ def test_required_fit_cache_fails_on_missing_records() -> None:
                 [ImageRecord(original, 0, "good")],
                 config,
                 {"name": "noise", "value": 1},
+            )
+
+def test_train_cache_never_falls_back_to_same_named_test_image() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "mvtec"
+        perturbed = Path(tmp) / "mvtec_perturbed"
+        original = root / "bottle" / "train" / "good" / "000.png"
+        wrong = perturbed / "bottle" / "brightness_m30" / "test" / "good" / "000.png"
+        _touch(original)
+        _touch(wrong)
+        config = {
+            "data": {
+                "root": str(root),
+                "perturbed_root": str(perturbed),
+                "require_perturbed_fit_transforms": True,
+            }
+        }
+
+        with pytest.raises(FileNotFoundError, match="Missing cached perturbed images"):
+            _records_from_perturbed_cache(
+                [ImageRecord(original, 0, "good")],
+                config,
+                {"name": "brightness", "value": -30},
             )
