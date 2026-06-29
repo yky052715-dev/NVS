@@ -25,6 +25,7 @@ from nvs.common import (
     resize_pil,
 )
 
+from .augmem import AugMemDetector
 from .datasets import (
     IMG_EXTS,
     RobustADRecord,
@@ -35,7 +36,11 @@ from .datasets import (
     parse_robustad_manifest,
     source_normal_training,
 )
-from .memory import MEMORY_PROTOCOLS, augmented_memory_candidates
+from .memory import (
+    MEMORY_PROTOCOLS,
+    augmented_memory_candidates,
+    matched_augmented_memory_candidates,
+)
 from .metrics import evaluate_pixel_metrics, safe_auroc
 from .pipeline import CORE_METHODS, ConditionalNVSPipeline, FeatureSplit
 from .protocol import (
@@ -359,11 +364,18 @@ def _pipeline(
 def _configured_methods(config: dict[str, Any]) -> tuple[str, ...]:
     report_methods = config.get("report_methods")
     if report_methods:
-        return tuple(str(method) for method in report_methods)
-    methods = list(CORE_METHODS)
-    if bool((config.get("stability_regularization", {}) or {}).get("enabled", False)):
-        methods.append("SR_CNVS")
-    return tuple(methods)
+        methods = [str(method) for method in report_methods]
+    else:
+        methods = list(CORE_METHODS)
+        if bool(
+            (config.get("stability_regularization", {}) or {}).get("enabled", False)
+        ):
+            methods.append("SR_CNVS")
+    aliases = {
+        str(method): str(alias)
+        for method, alias in (config.get("result_method_aliases", {}) or {}).items()
+    }
+    return tuple(aliases.get(method, method) for method in methods)
 
 
 def _validate_core_config(config: dict[str, Any]) -> None:
@@ -385,7 +397,7 @@ def _fit_category(
     seed: int,
     category_dir: Path,
     category: str,
-) -> tuple[ConditionalNVSPipeline, dict[str, Any], int]:
+) -> tuple[Any, dict[str, Any], int]:
     config["_perturbed_cache_usage"] = []
     split = split_three_way(
         train_records,
@@ -401,32 +413,132 @@ def _fit_category(
         category,
         key=lambda record: str(record.path),
     )
+    print(
+        f"[{category}] split calibration={len(split.calibration)} "
+        f"nvs_fit={len(split.nvs_fit)} memory={len(split.memory)}",
+        flush=True,
+    )
+    print(f"[{category}] extracting original memory/nvs_fit features", flush=True)
     memory_features, grid_side = _features(split.memory, config, model, device)
     nvs_original, _ = _features(split.nvs_fit, config, model, device)
-    nvs_transformed = tuple(
-        _features(split.nvs_fit, config, model, device, dict(spec))[0]
-        for spec in FIT_TRANSFORMS
-    )
-    if bool((config.get("augmem", {}) or {}).get("enabled", False)):
-        memory_transformed = [
-            _features(split.memory, config, model, device, dict(spec))[0]
-            for spec in FIT_TRANSFORMS
-        ]
-        memory_features = augmented_memory_candidates(
-            torch.cat([memory_features, nvs_original], dim=0),
-            [
-                torch.cat([memory_value, nvs_value], dim=0)
-                for memory_value, nvs_value in zip(
-                    memory_transformed, nvs_transformed
+    transformed_values = []
+    for index, spec in enumerate(FIT_TRANSFORMS, start=1):
+        print(
+            f"[{category}] fit transform {index}/{len(FIT_TRANSFORMS)} "
+            f"{transform_name(dict(spec))}",
+            flush=True,
+        )
+        transformed_values.append(
+            _features(split.nvs_fit, config, model, device, dict(spec))[0]
+        )
+    nvs_transformed = tuple(transformed_values)
+    augmem_config = config.get("augmem", {}) or {}
+    if bool(augmem_config.get("enabled", False)):
+        candidate_source = str(
+            augmem_config.get("candidate_source", "legacy_all_transformed")
+        )
+        if candidate_source == "matched_d2_information":
+            memory_features = matched_augmented_memory_candidates(
+                memory_features,
+                nvs_original,
+                nvs_transformed,
+            )
+        elif candidate_source == "legacy_all_transformed":
+            memory_transformed = [
+                _features(split.memory, config, model, device, dict(spec))[0]
+                for spec in FIT_TRANSFORMS
+            ]
+            memory_features = augmented_memory_candidates(
+                torch.cat([memory_features, nvs_original], dim=0),
+                [
+                    torch.cat([memory_value, nvs_value], dim=0)
+                    for memory_value, nvs_value in zip(
+                        memory_transformed, nvs_transformed
+                    )
+                ],
+            )
+        else:
+            raise ValueError(f"Unsupported augmem.candidate_source={candidate_source!r}")
+        candidate_layout = []
+        if candidate_source == "matched_d2_information":
+            patch_count = int(nvs_original.shape[1])
+            offset = 0
+            chunks = [
+                ("memory_original", len(split.memory) * patch_count),
+                ("nvs_fit_original", len(split.nvs_fit) * patch_count),
+                *[
+                    (
+                        f"nvs_fit_{transform_name(dict(spec))}",
+                        len(split.nvs_fit) * patch_count,
+                    )
+                    for spec in FIT_TRANSFORMS
+                ],
+            ]
+            for name, count in chunks:
+                candidate_layout.append(
+                    {"name": name, "start": offset, "stop": offset + count}
                 )
-            ],
+                offset += count
+            if offset != int(memory_features.shape[0]):
+                raise AssertionError("AugMem candidate layout does not cover the pool")
+        _save_json(
+            category_dir / "augmem_candidate_pool.json",
+            {
+                "candidate_source": candidate_source,
+                "memory_images": len(split.memory),
+                "nvs_fit_images": len(split.nvs_fit),
+                "fit_transform_count": len(nvs_transformed),
+                "candidate_entries": int(
+                    memory_features.reshape(-1, memory_features.shape[-1]).shape[0]
+                ),
+                "feature_dimension": int(memory_features.shape[-1]),
+                "uses_transformed_memory_split": candidate_source
+                == "legacy_all_transformed",
+                "candidate_layout": candidate_layout,
+            },
         )
-    pipeline = _pipeline(config, seed, device).fit(
-        FeatureSplit(
-            memory=memory_features,
-            nvs_fit_original=nvs_original,
-            nvs_fit_transformed=nvs_transformed,
+    if bool(augmem_config.get("enabled", False)) and str(
+        augmem_config.get("detection_mode", "conditional_pipeline")
+    ) == "memory_only":
+        memory_config = config["memory"]
+        strategy, capacity = MEMORY_PROTOCOLS[str(memory_config["protocol"])]
+        query_chunk_size = int(memory_config.get("query_chunk_size", 4096))
+        bank_chunk_size = int(memory_config.get("bank_chunk_size", 8192))
+        if device.type == "cuda":
+            query_chunk_size = int(
+                memory_config.get("gpu_query_chunk_size", query_chunk_size)
+            )
+            bank_chunk_size = int(
+                memory_config.get("gpu_bank_chunk_size", bank_chunk_size)
+            )
+        print(
+            f"[{category}] building memory-only AugMem bank "
+            f"strategy={strategy} capacity={capacity or 'full'} "
+            f"candidates={memory_features.reshape(-1, memory_features.shape[-1]).shape[0]}",
+            flush=True,
         )
+        pipeline = AugMemDetector(
+            memory_strategy=strategy,
+            memory_capacity=capacity,
+            seed=seed,
+            compute_device=device,
+            query_chunk_size=query_chunk_size,
+            bank_chunk_size=bank_chunk_size,
+            candidate_size=int(memory_config.get("candidate_size", 50_000)),
+            kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
+        ).fit(memory_features)
+    else:
+        pipeline = _pipeline(config, seed, device).fit(
+            FeatureSplit(
+                memory=memory_features,
+                nvs_fit_original=nvs_original,
+                nvs_fit_transformed=nvs_transformed,
+            )
+        )
+    print(
+        f"[{category}] memory ready entries={pipeline.memory_result.capacity}; "
+        "calibrating on original normal images",
+        flush=True,
     )
     calibration_features, _ = _features(split.calibration, config, model, device)
     pipeline.calibrate(
@@ -532,8 +644,10 @@ def _evaluate_records(
             if method in pipeline.calibrations
             else pipeline.calibrations["D3_NVSProto"]
         )
+        aliases = config.get("result_method_aliases", {}) or {}
+        reported_method = str(aliases.get(method, method))
         row: dict[str, Any] = {
-            "method": method,
+            "method": reported_method,
             "images": len(records),
             "inference_ms_per_image": elapsed * 1000.0 / max(1, len(records)),
             "memory_entries": pipeline.memory_result.capacity,
@@ -583,6 +697,8 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
             "D2_NVSGlobal": "global uncentered-delta SVD residual on d=q-m*",
             "D3_NVSProto": "prototype uncentered-delta SVD residual on d=q-m*",
             "SR_CNVS": "stability-regularized shrinkage between global and prototype NVS projectors",
+            "AugMem_K10": "cosine NN over matched-information augmented k-center memory (10k)",
+            "AugMem_Full": "cosine NN over matched-information uncompressed augmented memory",
         },
     )
     device = torch.device(args.device)
@@ -613,6 +729,7 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 not robustness_enabled or robustness_path.is_file()
             )
             if required_outputs_exist:
+                print(f"[{category}] valid completion marker; loading saved CSVs", flush=True)
                 all_rows.extend(_read_csv(metrics_path))
                 if robustness_enabled:
                     robustness_rows.extend(_read_csv(robustness_path))
@@ -645,6 +762,10 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 )
             ]
             for spec in specs:
+                print(
+                    f"[{category}] evaluating {transform_name(spec)}",
+                    flush=True,
+                )
                 shifted = _evaluate_records(
                     test_records,
                     pipeline,

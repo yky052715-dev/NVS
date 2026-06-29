@@ -7,6 +7,7 @@ import pytest
 
 from nvs.conditional_nvs.protocol import (
     completion_is_valid,
+    config_fingerprint,
     fit_calibration,
     protocol_metadata,
     split_three_way,
@@ -44,3 +45,19 @@ def test_completion_requires_protocol_identity(tmp_path) -> None:
     assert completion_is_valid(marker, expected)
     changed = dict(expected, seed=43)
     assert not completion_is_valid(marker, changed)
+
+def test_runtime_metadata_does_not_change_config_fingerprint(tmp_path) -> None:
+    manifest = split_three_way(list(range(20)), 42, 42).manifest()
+    config = {"model": {"name": "dinov2_vits14"}, "data": {}, "_runtime": [1]}
+    before = config_fingerprint(config)
+    expected = protocol_metadata("bottle", 42, manifest, config, ["D0_NN"])
+    marker = tmp_path / "complete.json"
+    write_completion(marker, expected)
+
+    config["_runtime"] = [1, 2, 3]
+    config["data"] = {"_perturbed_cache_usage": [{"hits": 10}]}
+    assert config_fingerprint(config) == before
+    assert completion_is_valid(
+        marker,
+        protocol_metadata("bottle", 42, manifest, config, ["D0_NN"]),
+    )

@@ -39,29 +39,32 @@ def pixel_aupro(
         raise ValueError("masks/maps must have matching [N,H,W] shapes")
     background = ~masks
     background_count = int(background.sum())
-    regions = [
-        region
-        for image_mask in masks
+    region_scores = [
+        maps[image_index][region]
+        for image_index, image_mask in enumerate(masks)
         for region in _components(image_mask)
         if region.any()
     ]
-    if background_count == 0 or not regions:
+    if background_count == 0 or not region_scores:
         return float("nan")
     flat = maps.reshape(-1)
     thresholds = np.unique(
         np.quantile(flat, np.linspace(0.0, 1.0, min(int(max_thresholds), flat.size)))
     )[::-1]
-    points = [(0.0, 0.0)]
-    for threshold in thresholds:
-        prediction = maps >= threshold
-        fpr = float(np.logical_and(prediction, background).sum() / background_count)
-        per_region = []
-        for image_index, image_mask in enumerate(masks):
-            for region in _components(image_mask):
-                if region.any():
-                    per_region.append(float(prediction[image_index][region].mean()))
-        points.append((fpr, float(np.mean(per_region))))
-    points.append((1.0, 1.0))
+    background_scores = np.sort(maps[background])
+    background_positive = background_count - np.searchsorted(
+        background_scores, thresholds, side="left"
+    )
+    region_overlaps = []
+    for scores in region_scores:
+        sorted_scores = np.sort(scores)
+        region_overlaps.append(
+            (scores.size - np.searchsorted(sorted_scores, thresholds, side="left"))
+            / scores.size
+        )
+    fprs = background_positive.astype(np.float64) / background_count
+    pros = np.mean(np.stack(region_overlaps, axis=0), axis=0)
+    points = [(0.0, 0.0), *zip(fprs.tolist(), pros.tolist()), (1.0, 1.0)]
     points.sort(key=lambda pair: pair[0])
     fpr = np.asarray([point[0] for point in points])
     pro = np.asarray([point[1] for point in points])
@@ -92,13 +95,35 @@ def binary_f1(mask, prediction) -> float:
 
 
 def oracle_f1(masks, maps, max_thresholds: int = 512) -> tuple[float, float]:
-    maps = np.asarray(maps, dtype=np.float64)
+    labels = np.asarray(masks, dtype=bool).reshape(-1)
+    scores = np.asarray(maps, dtype=np.float64).reshape(-1)
+    if labels.size != scores.size or scores.size == 0:
+        raise ValueError("masks/maps must have the same non-zero number of pixels")
     thresholds = np.unique(
-        np.quantile(maps, np.linspace(0.0, 1.0, min(max_thresholds, maps.size)))
+        np.quantile(scores, np.linspace(0.0, 1.0, min(max_thresholds, scores.size)))
     )
-    results = [(binary_f1(masks, maps >= threshold), float(threshold)) for threshold in thresholds]
-    valid = [item for item in results if np.isfinite(item[0])]
-    return max(valid, default=(float("nan"), float("nan")), key=lambda item: item[0])
+    order = np.argsort(scores, kind="stable")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order].astype(np.int64)
+    positive_prefix = np.concatenate(([0], np.cumsum(sorted_labels)))
+    starts = np.searchsorted(sorted_scores, thresholds, side="left")
+    total_positive = int(sorted_labels.sum())
+    true_positive = total_positive - positive_prefix[starts]
+    predicted_positive = scores.size - starts
+    false_positive = predicted_positive - true_positive
+    false_negative = total_positive - true_positive
+    denominator = 2 * true_positive + false_positive + false_negative
+    f1 = np.divide(
+        2.0 * true_positive,
+        denominator,
+        out=np.full(thresholds.shape, np.nan, dtype=np.float64),
+        where=denominator != 0,
+    )
+    valid = np.flatnonzero(np.isfinite(f1))
+    if valid.size == 0:
+        return float("nan"), float("nan")
+    best = int(valid[np.argmax(f1[valid])])
+    return float(f1[best]), float(thresholds[best])
 
 
 def localization_metrics(

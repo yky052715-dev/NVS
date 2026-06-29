@@ -270,3 +270,28 @@ def augmented_memory_candidates(
         values.reshape(-1, values.shape[-1]) for values in transformed_features
     )
     return F.normalize(torch.cat(chunks, dim=0).float(), dim=-1)
+
+def matched_augmented_memory_candidates(
+    memory_original: torch.Tensor,
+    nvs_fit_original: torch.Tensor,
+    nvs_fit_transformed: Iterable[torch.Tensor],
+) -> torch.Tensor:
+    """Build AugMem from exactly the feature information available to D2.
+
+    D2 retrieves from ``memory_original`` and fits its delta basis from the
+    aligned ``nvs_fit_original`` plus 13 transformed nvs_fit tensors. AugMem
+    receives those same tensors, but uses them as a direct retrieval pool.
+    It must not receive transformed memory-split images.
+    """
+
+    transformed = tuple(nvs_fit_transformed)
+    if len(transformed) != 13:
+        raise ValueError("Matched AugMem requires exactly 13 nvs_fit transforms")
+    if memory_original.ndim != 3 or nvs_fit_original.ndim != 3:
+        raise ValueError("Original feature tensors must have shape [N,P,C]")
+    if memory_original.shape[1:] != nvs_fit_original.shape[1:]:
+        raise ValueError("memory and nvs_fit patch feature shapes must match")
+    if any(values.shape != nvs_fit_original.shape for values in transformed):
+        raise ValueError("Transformed nvs_fit features must align with originals")
+    originals = torch.cat([memory_original, nvs_fit_original], dim=0)
+    return augmented_memory_candidates(originals, transformed)

@@ -4,6 +4,8 @@ import numpy as np
 
 from nvs.conditional_nvs.metrics import (
     average_relative_drop,
+    binary_f1,
+    oracle_f1,
     pixel_aupr,
     pixel_aupro,
 )
@@ -57,3 +59,61 @@ def test_aggregate_ard_separates_categories_and_seeds() -> None:
     assert all(row["seed"] == "42" for row in summary)
     assert np.isclose(summary[0]["ARD_pixel_AUROC"], -0.05)
     assert np.isclose(summary[1]["ARD_pixel_AUROC"], -0.10)
+
+def test_optimized_oracle_f1_matches_threshold_bruteforce() -> None:
+    rng = np.random.default_rng(17)
+    masks = rng.random((3, 9, 7)) > 0.82
+    maps = rng.random(masks.shape)
+    thresholds = np.unique(
+        np.quantile(maps, np.linspace(0.0, 1.0, min(37, maps.size)))
+    )
+    expected = max(
+        ((binary_f1(masks, maps >= threshold), float(threshold)) for threshold in thresholds),
+        key=lambda item: item[0],
+    )
+    actual = oracle_f1(masks, maps, max_thresholds=37)
+    assert np.allclose(actual, expected)
+
+def test_optimized_aupro_matches_bruteforce() -> None:
+    from scipy import ndimage
+
+    rng = np.random.default_rng(23)
+    masks = rng.random((2, 7, 8)) > 0.84
+    maps = rng.random(masks.shape)
+    max_fpr = 0.30
+    thresholds = np.unique(
+        np.quantile(maps, np.linspace(0.0, 1.0, min(29, maps.size)))
+    )[::-1]
+    background = ~masks
+    regions = []
+    for image_index, mask in enumerate(masks):
+        labels, count = ndimage.label(mask)
+        regions.extend(
+            (image_index, labels == region_index)
+            for region_index in range(1, count + 1)
+        )
+    points = [(0.0, 0.0)]
+    for threshold in thresholds:
+        prediction = maps >= threshold
+        fpr = np.logical_and(prediction, background).sum() / background.sum()
+        pro = np.mean(
+            [prediction[image_index][region].mean() for image_index, region in regions]
+        )
+        points.append((float(fpr), float(pro)))
+    points.append((1.0, 1.0))
+    points.sort(key=lambda pair: pair[0])
+    fpr = np.asarray([point[0] for point in points])
+    pro = np.asarray([point[1] for point in points])
+    unique_fpr = np.unique(fpr)
+    max_pro = np.asarray([pro[fpr == value].max() for value in unique_fpr])
+    if max_fpr not in unique_fpr:
+        interpolated = np.interp(max_fpr, unique_fpr, max_pro)
+        keep = unique_fpr < max_fpr
+        unique_fpr = np.append(unique_fpr[keep], max_fpr)
+        max_pro = np.append(max_pro[keep], interpolated)
+    else:
+        keep = unique_fpr <= max_fpr
+        unique_fpr, max_pro = unique_fpr[keep], max_pro[keep]
+    expected = np.trapz(max_pro, unique_fpr) / max_fpr
+
+    assert np.isclose(pixel_aupro(masks, maps, max_fpr=max_fpr, max_thresholds=29), expected)

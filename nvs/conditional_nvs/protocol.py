@@ -19,8 +19,22 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _without_runtime_fields(payload: Any) -> Any:
+    if isinstance(payload, Mapping):
+        return {
+            str(key): _without_runtime_fields(value)
+            for key, value in payload.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(payload, (list, tuple)):
+        return [_without_runtime_fields(value) for value in payload]
+    return payload
+
+
 def config_fingerprint(config: Mapping[str, Any]) -> str:
-    return stable_hash(config)
+    """Hash only persisted protocol settings, never transient run metadata."""
+
+    return stable_hash(_without_runtime_fields(config))
 
 
 @dataclass(frozen=True)
