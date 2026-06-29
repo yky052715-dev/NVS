@@ -21,18 +21,27 @@ def aggregate_ard(
     metric: str = "pixel_AUROC",
     identity_name: str = "identity_0",
 ) -> list[dict[str, Any]]:
-    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    optional_group_fields = tuple(
+        field
+        for field in ("category", "seed")
+        if rows and all(field in row for row in rows)
+    )
+    group_fields = (*optional_group_fields, "method")
+    groups: dict[tuple[str, ...], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[str(row["method"])].append(row)
+        key = tuple(str(row[field]) for field in group_fields)
+        groups[key].append(row)
     output = []
-    for method, selected in sorted(groups.items()):
+    for key, selected in sorted(groups.items()):
+        group = dict(zip(group_fields, key))
         identity = [
             float(row[metric])
             for row in selected
             if str(row["transform"]) == identity_name
         ]
         if len(identity) != 1:
-            raise ValueError(f"{method} requires exactly one identity row")
+            label = ", ".join(f"{field}={value}" for field, value in group.items())
+            raise ValueError(f"{label} requires exactly one identity row")
         targets = [
             float(row[metric])
             for row in selected
@@ -40,7 +49,7 @@ def aggregate_ard(
         ]
         output.append(
             {
-                "method": method,
+                **group,
                 f"source_{metric}": identity[0],
                 f"ARD_{metric}": average_relative_drop(identity[0], targets),
                 "target_count": len(targets),

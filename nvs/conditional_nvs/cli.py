@@ -105,6 +105,11 @@ def _write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
 
 
 
+def _read_csv(path: str | Path) -> list[dict[str, str]]:
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 _PERTURBED_INDEX_CACHE: dict[tuple[str, str, str], dict[str, Path]] = {}
 
 
@@ -599,7 +604,19 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
         metadata = protocol_metadata(category, seed, prospective, config, methods)
         marker = category_dir / "experiment_complete.json"
         if not args.force and completion_is_valid(marker, metadata):
-            continue
+            metrics_path = category_dir / "metrics_summary.csv"
+            robustness_path = category_dir / "unseen_robustness.csv"
+            robustness_enabled = bool(
+                (config.get("robustness", {}) or {}).get("enabled", False)
+            )
+            required_outputs_exist = metrics_path.is_file() and (
+                not robustness_enabled or robustness_path.is_file()
+            )
+            if required_outputs_exist:
+                all_rows.extend(_read_csv(metrics_path))
+                if robustness_enabled:
+                    robustness_rows.extend(_read_csv(robustness_path))
+                continue
         pipeline, manifest, _ = _fit_category(
             train_records,
             config,
@@ -654,6 +671,7 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
         metadata = protocol_metadata(category, seed, manifest, config, methods)
         write_completion(marker, metadata)
         _write_csv(output_dir / "category_metrics.csv", all_rows)
+    _write_csv(output_dir / "category_metrics.csv", all_rows)
     if robustness_rows:
         _write_csv(output_dir / "robustness_metrics.csv", robustness_rows)
         _save_json(
