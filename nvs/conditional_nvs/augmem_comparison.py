@@ -190,13 +190,14 @@ def assemble_comparison_rows(
             raise ValueError(f"{method} has {count}, expected {expected_per_method} rows")
     combined = selected_d2 + selected_augmem
     for method in (*D2_METHODS, AUGMEM_K10_METHOD):
-        capacities = {
-            int(float(row["memory_entries"]))
-            for row in combined
-            if str(row["method"]) == method
-        }
+        selected = [row for row in combined if str(row["method"]) == method]
+        if any("memory_entries" not in row for row in selected):
+            raise ValueError(f"{method} rows are missing memory_entries")
+        capacities = {int(float(row["memory_entries"])) for row in selected}
         if capacities != {10_000}:
-            raise ValueError(f"{method} memory capacity must be exactly 10000, got {capacities}")
+            raise ValueError(
+                f"{method} memory capacity must be exactly 10000, got {capacities}"
+            )
     if full_rows is not None:
         selected_full = [
             dict(row)

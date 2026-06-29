@@ -79,6 +79,7 @@ def test_comparison_requires_identical_evaluation_coverage() -> None:
         "seed": "42",
         "transform": "identity_0",
         "pixel_AUROC": "0.9",
+        "memory_entries": "10000",
     }
     d2 = [
         {**base, "method": "D0_NN"},
