@@ -698,6 +698,7 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
             "D3_NVSProto": "prototype uncentered-delta SVD residual on d=q-m*",
             "SR_CNVS": "stability-regularized shrinkage between global and prototype NVS projectors",
             "AugMem_K10": "cosine NN over matched-information augmented k-center memory (10k)",
+            "AugMem_K10_100k": "cosine NN over 100k matched-information candidates compressed to 10k",
             "AugMem_Full": "cosine NN over matched-information uncompressed augmented memory",
         },
     )
