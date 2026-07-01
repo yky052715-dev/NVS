@@ -14,6 +14,8 @@ MEMORY_PROTOCOLS = {
     "M_K5": ("kcenter", 5_000),
     "M_R10": ("random", 10_000),
     "M_K10": ("kcenter", 10_000),
+    "M_MRK10": ("kcenter_merge_reduce", 10_000),
+    "M_IBK10": ("kcenter_image_balanced", 10_000),
     "M_R30": ("random", 30_000),
     "M_K30": ("kcenter", 30_000),
     "M_F0": ("full", 0),
@@ -159,12 +161,65 @@ def merge_reduce_kcenter_indices(
     return merged[final_local]
 
 
+def group_balanced_kcenter_indices(
+    values: torch.Tensor,
+    group_indices: torch.Tensor,
+    k: int,
+    seed: int,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    """Select near-equal per-group quotas with within-group exact k-center."""
+
+    values = values.float().contiguous()
+    groups = group_indices.long().cpu().reshape(-1)
+    n = int(values.shape[0])
+    if groups.numel() != n:
+        raise ValueError("group_indices must align with values")
+    k = min(max(1, int(k)), n)
+    unique, counts = torch.unique(groups, sorted=True, return_counts=True)
+    quotas = torch.zeros_like(counts)
+    allocated = 0
+    while allocated < k:
+        progressed = False
+        for index in range(int(unique.numel())):
+            if quotas[index] >= counts[index]:
+                continue
+            quotas[index] += 1
+            allocated += 1
+            progressed = True
+            if allocated == k:
+                break
+        if not progressed:
+            raise AssertionError("Unable to allocate balanced group quotas")
+
+    selected: list[torch.Tensor] = []
+    for ordinal, (group, quota) in enumerate(
+        zip(unique.tolist(), quotas.tolist())
+    ):
+        if quota <= 0:
+            continue
+        members = torch.nonzero(groups == int(group), as_tuple=True)[0]
+        local = greedy_kcenter_indices(
+            values[members.to(values.device, non_blocking=True)],
+            int(quota),
+            seed=int(seed) + 104729 * ordinal,
+            chunk_size=chunk_size,
+            batch_select=1,
+        )
+        selected.append(members[local])
+    output = torch.cat(selected).long().cpu()
+    if output.numel() != k or torch.unique(output).numel() != k:
+        raise AssertionError("Balanced k-center did not return K unique indices")
+    return output
+
+
 def build_memory(
     features: torch.Tensor,
     strategy: str,
     capacity: int,
     seed: int,
     candidate_indices: torch.Tensor | None = None,
+    group_indices: torch.Tensor | None = None,
     candidate_size: int = 50_000,
     block_size: int = 50_000,
     chunk_size: int = 8192,
@@ -227,6 +282,30 @@ def build_memory(
                 batch_select=batch_select,
             )
             algorithm = "shared_candidate_greedy_kcenter"
+        elif strategy == "kcenter_merge_reduce":
+            local = merge_reduce_kcenter_indices(
+                flat[candidates.to(flat.device, non_blocking=True)],
+                target,
+                seed=seed,
+                block_size=block_size,
+                chunk_size=chunk_size,
+                batch_select=large_k_batch_select,
+            )
+            algorithm = "shared_candidate_merge_reduce_kcenter_gamma2"
+        elif strategy == "kcenter_image_balanced":
+            if group_indices is None:
+                raise ValueError("Image-balanced k-center requires group_indices")
+            groups = group_indices.long().cpu().reshape(-1)
+            if groups.numel() != n:
+                raise ValueError("group_indices must align with flattened features")
+            local = group_balanced_kcenter_indices(
+                flat[candidates.to(flat.device, non_blocking=True)],
+                groups[candidates],
+                target,
+                seed=seed,
+                chunk_size=chunk_size,
+            )
+            algorithm = "shared_candidate_image_balanced_kcenter"
         else:
             raise ValueError(f"Unsupported memory strategy: {strategy}")
         selected = candidates[local]

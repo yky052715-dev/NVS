@@ -1,0 +1,70 @@
+experiment:
+  output_dir: outputs/conditional_nvs/memory_partition_audit
+  seed: 42
+core_experiment:
+  enabled: true
+data:
+  categories: [bottle, metal_nut, grid, leather, screw]
+  input_size: 518
+  calibration_fraction: 0.20
+  nvs_fit_fraction_of_remainder: 0.30
+  num_workers: 8
+model:
+  name: dinov2_vits14
+  hub_dir: null
+  batch_size: 16
+  gpu_batch_size: 16
+memory:
+  protocol: M_MRK10
+  candidate_size: 50000
+  query_chunk_size: 4096
+  bank_chunk_size: 8192
+  gpu_query_chunk_size: 32768
+  gpu_bank_chunk_size: 65536
+  kcenter_chunk_size: 8192
+  kcenter_block_size: 10000
+  large_k_batch_select: 64
+subspace:
+  rank: 8
+  prototypes: 128
+  prototype_selection: proto_by_mstar
+calibration:
+  mad_epsilon: 1.0e-6
+  image_quantile: 0.95
+metrics:
+  small_defect_area_fraction: 0.01
+whitening:
+  mode: cosine
+  rho: 0.99
+  lambda: 0.07
+  relative_floor: 1.0e-8
+  max_components: null
+fusion:
+  enabled: false
+postprocess:
+  enabled: false
+augmem:
+  enabled: false
+memory_ablation:
+  d0_only: true
+memory_partition_audit:
+  retrospective: true
+  baseline: M_K10
+  variants: [M_MRK10, M_IBK10]
+  shared_candidate_pool: 50000
+  final_capacity: 10000
+report_methods: [D0_NN]
+fit_transforms:
+  - {name: brightness, value: -30}
+  - {name: brightness, value: -15}
+  - {name: brightness, value: 15}
+  - {name: brightness, value: 30}
+  - {name: contrast, value: 0.75}
+  - {name: contrast, value: 0.90}
+  - {name: contrast, value: 1.10}
+  - {name: contrast, value: 1.25}
+  - {name: blur, value: 0.5}
+  - {name: blur, value: 1.0}
+  - {name: blur, value: 1.5}
+  - {name: noise, value: 1}
+  - {name: noise, value: 3}

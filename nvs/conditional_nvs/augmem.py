@@ -25,6 +25,8 @@ class AugMemDetector:
         bank_chunk_size: int,
         candidate_size: int = 50_000,
         kcenter_chunk_size: int = 8192,
+        kcenter_block_size: int = 50_000,
+        large_k_batch_select: int = 64,
     ) -> None:
         self.memory_strategy = str(memory_strategy)
         self.memory_capacity = int(memory_capacity)
@@ -34,10 +36,19 @@ class AugMemDetector:
         self.bank_chunk_size = int(bank_chunk_size)
         self.candidate_size = int(candidate_size)
         self.kcenter_chunk_size = int(kcenter_chunk_size)
+        self.kcenter_block_size = int(kcenter_block_size)
+        self.large_k_batch_select = int(large_k_batch_select)
         self.memory_result: MemoryBuildResult | None = None
         self.calibrations: dict[str, CalibrationState] = {}
+        self.candidate_group_counts: dict[int, int] = {}
+        self.selected_group_counts: dict[int, int] = {}
 
     def fit(self, candidates: torch.Tensor) -> "AugMemDetector":
+        group_indices = None
+        if candidates.ndim == 3:
+            group_indices = torch.arange(candidates.shape[0]).repeat_interleave(
+                candidates.shape[1]
+            )
         values = F.normalize(
             candidates.reshape(-1, candidates.shape[-1])
             .float()
@@ -49,9 +60,29 @@ class AugMemDetector:
             strategy=self.memory_strategy,
             capacity=self.memory_capacity,
             seed=self.seed,
+            group_indices=group_indices,
             candidate_size=self.candidate_size,
+            block_size=self.kcenter_block_size,
             chunk_size=self.kcenter_chunk_size,
+            large_k_batch_select=self.large_k_batch_select,
         )
+        if group_indices is not None:
+            candidate_groups = group_indices[self.memory_result.candidate_indices]
+            selected_groups = group_indices[
+                self.memory_result.selected_memory_indices
+            ]
+            self.candidate_group_counts = {
+                int(group): int(count)
+                for group, count in zip(
+                    *torch.unique(candidate_groups, sorted=True, return_counts=True)
+                )
+            }
+            self.selected_group_counts = {
+                int(group): int(count)
+                for group, count in zip(
+                    *torch.unique(selected_groups, sorted=True, return_counts=True)
+                )
+            }
         return self
 
     def _require_fitted(self) -> MemoryBuildResult:
@@ -128,4 +159,8 @@ class AugMemDetector:
             "candidate_indices": memory.candidate_indices.detach().cpu().tolist(),
             "selected_memory_indices": memory.selected_memory_indices.detach().cpu().tolist(),
             "candidate_size": self.candidate_size,
+            "kcenter_block_size": self.kcenter_block_size,
+            "large_k_batch_select": self.large_k_batch_select,
+            "candidate_group_counts": self.candidate_group_counts,
+            "selected_group_counts": self.selected_group_counts,
         }

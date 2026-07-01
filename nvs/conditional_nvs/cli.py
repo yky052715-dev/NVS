@@ -389,11 +389,16 @@ def _validate_core_config(config: dict[str, Any]) -> None:
     if [dict(item) for item in transforms] != [dict(item) for item in FIT_TRANSFORMS]:
         raise ValueError("NVS fit transform protocol must be the fixed 13 transforms")
     memory_ablation = config.get("memory_ablation", {}) or {}
-    if bool(memory_ablation.get("d0_only", False)):
+    d0_only = bool(memory_ablation.get("d0_only", False))
+    if d0_only:
         if [str(value) for value in config.get("report_methods", [])] != ["D0_NN"]:
             raise ValueError("D0-only memory ablation must report only D0_NN")
         if bool((config.get("augmem", {}) or {}).get("enabled", False)):
             raise ValueError("D0-only memory ablation cannot enable AugMem")
+    audit_protocols = {"M_MRK10", "M_IBK10"}
+    if str((config.get("memory", {}) or {}).get("protocol")) in audit_protocols:
+        if not d0_only:
+            raise ValueError("Partition-audit memory protocols are D0-only")
 
 
 def _fit_category(
@@ -549,6 +554,10 @@ def _fit_category(
             bank_chunk_size=bank_chunk_size,
             candidate_size=int(memory_config.get("candidate_size", 50_000)),
             kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
+            kcenter_block_size=int(memory_config.get("kcenter_block_size", 50_000)),
+            large_k_batch_select=int(
+                memory_config.get("large_k_batch_select", 64)
+            ),
         ).fit(memory_features)
     else:
         assert nvs_original is not None
