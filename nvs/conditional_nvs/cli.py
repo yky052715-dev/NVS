@@ -388,6 +388,12 @@ def _validate_core_config(config: dict[str, Any]) -> None:
     transforms = config.get("fit_transforms", list(FIT_TRANSFORMS))
     if [dict(item) for item in transforms] != [dict(item) for item in FIT_TRANSFORMS]:
         raise ValueError("NVS fit transform protocol must be the fixed 13 transforms")
+    memory_ablation = config.get("memory_ablation", {}) or {}
+    if bool(memory_ablation.get("d0_only", False)):
+        if [str(value) for value in config.get("report_methods", [])] != ["D0_NN"]:
+            raise ValueError("D0-only memory ablation must report only D0_NN")
+        if bool((config.get("augmem", {}) or {}).get("enabled", False)):
+            raise ValueError("D0-only memory ablation cannot enable AugMem")
 
 
 def _fit_category(
@@ -419,22 +425,35 @@ def _fit_category(
         f"nvs_fit={len(split.nvs_fit)} memory={len(split.memory)}",
         flush=True,
     )
-    print(f"[{category}] extracting original memory/nvs_fit features", flush=True)
+    d0_memory_only = bool(
+        (config.get("memory_ablation", {}) or {}).get("d0_only", False)
+    )
+    feature_message = (
+        "original memory features (D0-only ablation)"
+        if d0_memory_only
+        else "original memory/nvs_fit features"
+    )
+    print(f"[{category}] extracting {feature_message}", flush=True)
     memory_features, grid_side = _features(split.memory, config, model, device)
-    nvs_original, _ = _features(split.nvs_fit, config, model, device)
-    transformed_values = []
-    for index, spec in enumerate(FIT_TRANSFORMS, start=1):
-        print(
-            f"[{category}] fit transform {index}/{len(FIT_TRANSFORMS)} "
-            f"{transform_name(dict(spec))}",
-            flush=True,
-        )
-        transformed_values.append(
-            _features(split.nvs_fit, config, model, device, dict(spec))[0]
-        )
-    nvs_transformed = tuple(transformed_values)
+    if d0_memory_only:
+        nvs_original = None
+        nvs_transformed = ()
+    else:
+        nvs_original, _ = _features(split.nvs_fit, config, model, device)
+        transformed_values = []
+        for index, spec in enumerate(FIT_TRANSFORMS, start=1):
+            print(
+                f"[{category}] fit transform {index}/{len(FIT_TRANSFORMS)} "
+                f"{transform_name(dict(spec))}",
+                flush=True,
+            )
+            transformed_values.append(
+                _features(split.nvs_fit, config, model, device, dict(spec))[0]
+            )
+        nvs_transformed = tuple(transformed_values)
     augmem_config = config.get("augmem", {}) or {}
     if bool(augmem_config.get("enabled", False)):
+        assert nvs_original is not None
         candidate_source = str(
             augmem_config.get("candidate_source", "legacy_all_transformed")
         )
@@ -498,9 +517,11 @@ def _fit_category(
                 "candidate_layout": candidate_layout,
             },
         )
-    if bool(augmem_config.get("enabled", False)) and str(
-        augmem_config.get("detection_mode", "conditional_pipeline")
-    ) == "memory_only":
+    if d0_memory_only or (
+        bool(augmem_config.get("enabled", False))
+        and str(augmem_config.get("detection_mode", "conditional_pipeline"))
+        == "memory_only"
+    ):
         memory_config = config["memory"]
         strategy, capacity = MEMORY_PROTOCOLS[str(memory_config["protocol"])]
         query_chunk_size = int(memory_config.get("query_chunk_size", 4096))
@@ -513,7 +534,8 @@ def _fit_category(
                 memory_config.get("gpu_bank_chunk_size", bank_chunk_size)
             )
         print(
-            f"[{category}] building memory-only AugMem bank "
+            f"[{category}] building memory-only "
+            f"{'D0 ablation' if d0_memory_only else 'AugMem'} bank "
             f"strategy={strategy} capacity={capacity or 'full'} "
             f"candidates={memory_features.reshape(-1, memory_features.shape[-1]).shape[0]}",
             flush=True,
@@ -529,6 +551,7 @@ def _fit_category(
             kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
         ).fit(memory_features)
     else:
+        assert nvs_original is not None
         pipeline = _pipeline(config, seed, device).fit(
             FeatureSplit(
                 memory=memory_features,

@@ -8,16 +8,20 @@ data:
   input_size: 518
   calibration_fraction: 0.20
   nvs_fit_fraction_of_remainder: 0.30
-  num_workers: 4
+  num_workers: 16
 model:
   name: dinov2_vits14
   hub_dir: null
-  batch_size: 4
+  batch_size: 16
+  gpu_batch_size: 32
 memory:
   protocol: M_R5
   candidate_size: 50000
   query_chunk_size: 4096
   bank_chunk_size: 8192
+  gpu_query_chunk_size: 65536
+  gpu_bank_chunk_size: 131072
+  kcenter_chunk_size: 8192
 subspace:
   rank: 8
   prototypes: 128
@@ -39,6 +43,9 @@ postprocess:
   enabled: false
 augmem:
   enabled: false
+memory_ablation:
+  d0_only: true
+report_methods: [D0_NN]
 fit_transforms:
   - {name: brightness, value: -30}
   - {name: brightness, value: -15}

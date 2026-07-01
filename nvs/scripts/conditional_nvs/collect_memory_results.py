@@ -14,6 +14,9 @@ def main() -> None:
     )
     parser.add_argument("roots", nargs="+")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--expected-categories", type=int)
+    parser.add_argument("--require-protocols", nargs="*", default=[])
+    parser.add_argument("--require-seeds", nargs="*", type=int, default=[])
     args = parser.parse_args()
     grouped: dict[tuple[str, int], list[dict[str, str]]] = defaultdict(list)
     seen = set()
@@ -32,6 +35,40 @@ def main() -> None:
                         continue
                     seen.add(identity)
                     grouped[(identity[0], identity[1])].append(row)
+    if args.expected_categories is not None:
+        if int(args.expected_categories) <= 0:
+            raise ValueError("--expected-categories must be positive")
+        required_protocols = [str(value) for value in args.require_protocols]
+        required_seeds = [int(value) for value in args.require_seeds]
+        if bool(required_protocols) != bool(required_seeds):
+            raise ValueError(
+                "--require-protocols and --require-seeds must be provided together"
+            )
+        required_pairs = (
+            [(protocol, seed) for protocol in required_protocols for seed in required_seeds]
+            if required_protocols
+            else sorted(grouped)
+        )
+        for protocol, seed in required_pairs:
+            rows = grouped.get((protocol, seed), [])
+            categories = {str(row["category"]) for row in rows}
+            if len(categories) != int(args.expected_categories):
+                raise RuntimeError(
+                    f"Incomplete memory result {protocol}/seed{seed}: "
+                    f"{len(categories)}/{int(args.expected_categories)} categories"
+                )
+        if required_protocols:
+            allowed_protocols = set(required_protocols)
+            allowed_seeds = set(required_seeds)
+            grouped = defaultdict(
+                list,
+                {
+                    key: rows
+                    for key, rows in grouped.items()
+                    if key[0] in allowed_protocols and key[1] in allowed_seeds
+                },
+            )
+
     output_rows = []
     for (protocol, seed), rows in sorted(grouped.items()):
         output_rows.append(
