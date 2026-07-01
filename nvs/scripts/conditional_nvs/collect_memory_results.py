@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+
+
+def _metric_paths(root: str | Path) -> list[Path]:
+    base = Path(root)
+    leaf_paths = sorted(base.rglob("metrics_summary.csv"))
+    if leaf_paths:
+        return leaf_paths
+    return sorted(base.rglob("category_metrics.csv"))
 
 
 def main() -> None:
@@ -21,11 +30,24 @@ def main() -> None:
     grouped: dict[tuple[str, int], list[dict[str, str]]] = defaultdict(list)
     seen = set()
     for root in args.roots:
-        for path in Path(root).rglob("category_metrics.csv"):
+        for path in _metric_paths(root):
+            marker = None
+            if path.name == "metrics_summary.csv":
+                marker_path = path.parent / "experiment_complete.json"
+                if not marker_path.is_file():
+                    raise RuntimeError(f"Missing completion marker for {path}")
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                if marker.get("status") != "complete":
+                    raise RuntimeError(f"Incomplete result beside {path}")
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 for row in csv.DictReader(handle):
                     if row.get("method") != "D0_NN":
                         continue
+                    if marker is not None and (
+                        str(row["category"]) != str(marker["category"])
+                        or int(row["seed"]) != int(marker["seed"])
+                    ):
+                        raise RuntimeError(f"CSV/marker identity mismatch for {path}")
                     identity = (
                         row["memory_protocol"],
                         int(row["seed"]),
