@@ -41,7 +41,7 @@ from .memory import (
     augmented_memory_candidates,
     matched_augmented_memory_candidates,
 )
-from .metrics import evaluate_pixel_metrics, safe_auroc
+from .metrics import evaluate_pixel_metrics, pixel_aupr, safe_auroc
 from .pipeline import CORE_METHODS, ConditionalNVSPipeline, FeatureSplit
 from .protocol import (
     completion_is_valid,
@@ -654,6 +654,9 @@ def _evaluate_records(
             "memory_entries": pipeline.memory_result.capacity,
             "threshold": calibration.threshold,
             "image_AUROC": safe_auroc(
+                labels, maps.reshape(maps.shape[0], -1).max(axis=1)
+            ),
+            "image_AUPR": pixel_aupr(
                 labels, maps.reshape(maps.shape[0], -1).max(axis=1)
             ),
         }
