@@ -248,19 +248,37 @@ def select_memory_protocol(
                     "seeds": sorted({int(row["seed"]) for row in selected}),
                 }
             )
-        aggregated.sort(key=lambda row: (-row["pixel_AUROC_mean"], row["normal_FP_mean"], row["capacity"], row["inference_ms"]))
-        if len(aggregated) >= 2 and aggregated[0]["pixel_AUROC_mean"] - aggregated[1]["pixel_AUROC_mean"] <= auroc_tolerance:
-            pair = sorted(
-                aggregated[:2],
-                key=lambda row: (
-                    row["normal_FP_mean"],
-                    row["pixel_AUROC_std"],
-                    row["capacity"],
-                    row["inference_ms"],
-                ),
+        aggregated.sort(
+            key=lambda row: (
+                -row["pixel_AUROC_mean"],
+                row["normal_FP_mean"],
+                row["capacity"],
+                row["inference_ms"],
             )
-            aggregated[:2] = pair
-        return aggregated
+        )
+        if not aggregated:
+            return aggregated
+        best_auroc = aggregated[0]["pixel_AUROC_mean"]
+        tolerance_group = [
+            row
+            for row in aggregated
+            if best_auroc - row["pixel_AUROC_mean"] <= auroc_tolerance
+        ]
+        outside_group = [
+            row
+            for row in aggregated
+            if best_auroc - row["pixel_AUROC_mean"] > auroc_tolerance
+        ]
+        tolerance_group.sort(
+            key=lambda row: (
+                row["normal_FP_mean"],
+                row["pixel_AUROC_std"],
+                row["capacity"],
+                row["inference_ms"],
+                -row["pixel_AUROC_mean"],
+            )
+        )
+        return tolerance_group + outside_group
 
     first = rank_rows(seed42_rows)
     if len(first) < 2:
