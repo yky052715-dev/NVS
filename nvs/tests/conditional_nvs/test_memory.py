@@ -80,3 +80,22 @@ def test_group_balanced_kcenter_is_reproducible() -> None:
     assert torch.equal(
         torch.bincount(groups[first], minlength=3), torch.full((3,), 5)
     )
+
+def test_build_memory_can_preserve_whitened_magnitudes() -> None:
+    values = torch.tensor(
+        [[1.0, 0.0], [0.0, 2.0], [3.0, 4.0], [2.0, 1.0]],
+        dtype=torch.float32,
+    )
+    preserved = build_memory(
+        values,
+        strategy="random",
+        capacity=3,
+        seed=5,
+        normalize_features=False,
+    )
+    expected = values[preserved.selected_memory_indices]
+    assert torch.allclose(preserved.memory_bank, expected)
+    normalized = build_memory(values, strategy="random", capacity=3, seed=5)
+    assert torch.allclose(
+        normalized.memory_bank.norm(dim=1), torch.ones(3), atol=1.0e-6
+    )

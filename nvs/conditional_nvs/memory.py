@@ -224,10 +224,12 @@ def build_memory(
     block_size: int = 50_000,
     chunk_size: int = 8192,
     large_k_batch_select: int = 64,
+    normalize_features: bool = True,
 ) -> MemoryBuildResult:
-    flat = F.normalize(
-        features.reshape(-1, features.shape[-1]).float(), dim=-1
-    ).contiguous()
+    flat = features.reshape(-1, features.shape[-1]).float()
+    if normalize_features:
+        flat = F.normalize(flat, dim=-1)
+    flat = flat.contiguous()
     n = int(flat.shape[0])
     if n == 0:
         raise ValueError("Cannot build an empty memory bank")

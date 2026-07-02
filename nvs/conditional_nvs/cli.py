@@ -26,6 +26,7 @@ from nvs.common import (
 )
 
 from .augmem import AugMemDetector
+from .distance_ablation import DistanceAblationDetector
 from .datasets import (
     IMG_EXTS,
     RobustADRecord,
@@ -390,11 +391,27 @@ def _validate_core_config(config: dict[str, Any]) -> None:
         raise ValueError("NVS fit transform protocol must be the fixed 13 transforms")
     memory_ablation = config.get("memory_ablation", {}) or {}
     d0_only = bool(memory_ablation.get("d0_only", False))
+    distance_ablation = config.get("distance_ablation", {}) or {}
+    distance_enabled = bool(distance_ablation.get("enabled", False))
     if d0_only:
-        if [str(value) for value in config.get("report_methods", [])] != ["D0_NN"]:
+        expected_methods = ["E0", "E1", "E2", "E3"] if distance_enabled else ["D0_NN"]
+        if [str(value) for value in config.get("report_methods", [])] != expected_methods:
+            if distance_enabled:
+                raise ValueError(
+                    f"Distance ablation must report exactly {expected_methods}"
+                )
             raise ValueError("D0-only memory ablation must report only D0_NN")
         if bool((config.get("augmem", {}) or {}).get("enabled", False)):
             raise ValueError("D0-only memory ablation cannot enable AugMem")
+    if distance_enabled:
+        if not d0_only:
+            raise ValueError("Distance ablation must use the D0-only path")
+        if str((config.get("memory", {}) or {}).get("protocol")) != "M_K10":
+            raise ValueError("Distance ablation is fixed to M_K10")
+        if bool((config.get("robustness", {}) or {}).get("enabled", False)):
+            raise ValueError("Distance gate1 is fixed to identity evaluation")
+        if str(distance_ablation.get("whitening_estimator")) != "ledoit_wolf":
+            raise ValueError("Distance ablation requires Ledoit-Wolf whitening")
     audit_protocols = {"M_MRK10", "M_IBK10"}
     if str((config.get("memory", {}) or {}).get("protocol")) in audit_protocols:
         if not d0_only:
@@ -545,20 +562,37 @@ def _fit_category(
             f"candidates={memory_features.reshape(-1, memory_features.shape[-1]).shape[0]}",
             flush=True,
         )
-        pipeline = AugMemDetector(
-            memory_strategy=strategy,
-            memory_capacity=capacity,
-            seed=seed,
-            compute_device=device,
-            query_chunk_size=query_chunk_size,
-            bank_chunk_size=bank_chunk_size,
-            candidate_size=int(memory_config.get("candidate_size", 50_000)),
-            kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
-            kcenter_block_size=int(memory_config.get("kcenter_block_size", 50_000)),
-            large_k_batch_select=int(
-                memory_config.get("large_k_batch_select", 64)
-            ),
-        ).fit(memory_features)
+        distance_config = config.get("distance_ablation", {}) or {}
+        if bool(distance_config.get("enabled", False)):
+            pipeline = DistanceAblationDetector(
+                memory_capacity=capacity,
+                seed=seed,
+                compute_device=device,
+                query_chunk_size=query_chunk_size,
+                bank_chunk_size=bank_chunk_size,
+                candidate_size=int(memory_config.get("candidate_size", 50_000)),
+                kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
+                relative_floor=float(distance_config.get("relative_floor", 1.0e-8)),
+                diagnostic_queries=int(distance_config.get("diagnostic_queries", 2048)),
+                diagnostic_query_chunk_size=int(
+                    distance_config.get("diagnostic_query_chunk_size", 512)
+                ),
+            ).fit(memory_features)
+        else:
+            pipeline = AugMemDetector(
+                memory_strategy=strategy,
+                memory_capacity=capacity,
+                seed=seed,
+                compute_device=device,
+                query_chunk_size=query_chunk_size,
+                bank_chunk_size=bank_chunk_size,
+                candidate_size=int(memory_config.get("candidate_size", 50_000)),
+                kcenter_chunk_size=int(memory_config.get("kcenter_chunk_size", 8192)),
+                kcenter_block_size=int(memory_config.get("kcenter_block_size", 50_000)),
+                large_k_batch_select=int(
+                    memory_config.get("large_k_batch_select", 64)
+                ),
+            ).fit(memory_features)
     else:
         assert nvs_original is not None
         pipeline = _pipeline(config, seed, device).fit(
@@ -679,10 +713,12 @@ def _evaluate_records(
         )
         aliases = config.get("result_method_aliases", {}) or {}
         reported_method = str(aliases.get(method, method))
+        method_times = getattr(pipeline, "last_method_inference_seconds", {})
+        method_elapsed = float(method_times.get(method, elapsed))
         row: dict[str, Any] = {
             "method": reported_method,
             "images": len(records),
-            "inference_ms_per_image": elapsed * 1000.0 / max(1, len(records)),
+            "inference_ms_per_image": method_elapsed * 1000.0 / max(1, len(records)),
             "memory_entries": pipeline.memory_result.capacity,
             "threshold": calibration.threshold,
             "image_AUROC": safe_auroc(
@@ -736,6 +772,10 @@ def _run_mvtec(args: argparse.Namespace, config: dict[str, Any]) -> None:
             "AugMem_K10": "cosine NN over matched-information augmented k-center memory (10k)",
             "AugMem_K10_100k": "cosine NN over 100k matched-information candidates compressed to 10k",
             "AugMem_Full": "cosine NN over matched-information uncompressed augmented memory",
+            "E0": "raw L2-normalized k-center; raw Euclidean nearest-neighbor distance",
+            "E1": "Ledoit-Wolf-whitened k-center; raw Euclidean nearest-neighbor distance",
+            "E2": "raw L2-normalized k-center; Mahalanobis nearest-neighbor distance",
+            "E3": "Ledoit-Wolf-whitened k-center; Mahalanobis nearest-neighbor distance",
         },
     )
     device = torch.device(args.device)
